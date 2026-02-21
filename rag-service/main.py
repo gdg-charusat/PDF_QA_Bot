@@ -79,8 +79,14 @@ def generate_response(prompt: str, max_new_tokens: int) -> str:
 class PDFPath(BaseModel):
     filePath: str
 
+class ChatMessage(BaseModel):
+    role: str
+    text: str
+
+
 class Question(BaseModel):
     question: str
+    history: list[ChatMessage] | None = None
 
 
 class SummarizeRequest(BaseModel):
@@ -118,10 +124,24 @@ def ask_question(data: Question):
 
     context = "\n\n".join([doc.page_content for doc in docs])
 
+    history_text = ""
+    if data.history:
+        history_lines = [
+            f"{'User' if m.role == 'user' else 'Assistant'}: {m.text}"
+            for m in data.history[-10:]  # Last 10 messages to avoid token overflow
+        ]
+        history_text = (
+            "Previous conversation:\n"
+            + "\n".join(history_lines)
+            + "\n\n"
+        )
+
     prompt = (
         "You are a helpful assistant for question answering over PDF documents. "
-        "Use only the provided context. If the context does not contain the answer, say so briefly.\n\n"
+        "Use the provided context and previous conversation for context. "
+        "If the context does not contain the answer, say so briefly.\n\n"
         f"Context:\n{context}\n\n"
+        f"{history_text}"
         f"Question: {data.question}\n"
         "Answer:"
     )

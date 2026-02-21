@@ -60,19 +60,27 @@ function App() {
     setUploading(false);
   };
 
-  // Chat per PDF
+  // Chat per PDF with conversation history for context
   const askQuestion = async () => {
     if (!question.trim() || !selectedPdf) return;
+    const currentChat = pdfs.find(pdf => pdf.name === selectedPdf)?.chat || [];
     setAsking(true);
     setPdfs(prev => prev.map(pdf => pdf.name === selectedPdf ? { ...pdf, chat: [...pdf.chat, { role: "user", text: question }] } : pdf));
     try {
-      const res = await axios.post(`${API_BASE}/ask`, { question });
+      const history = currentChat.map(({ role, text }) => ({ role, text }));
+      const res = await axios.post(`${API_BASE}/ask`, { question, history });
       setPdfs(prev => prev.map(pdf => pdf.name === selectedPdf ? { ...pdf, chat: [...pdf.chat, { role: "bot", text: res.data.answer }] } : pdf));
     } catch (e) {
       setPdfs(prev => prev.map(pdf => pdf.name === selectedPdf ? { ...pdf, chat: [...pdf.chat, { role: "bot", text: "Error getting answer." }] } : pdf));
     }
     setQuestion("");
     setAsking(false);
+  };
+
+  // Clear chat history for the selected PDF
+  const clearHistory = () => {
+    if (!selectedPdf) return;
+    setPdfs(prev => prev.map(pdf => pdf.name === selectedPdf ? { ...pdf, chat: [] } : pdf));
   };
 
   // Summarization
@@ -294,6 +302,14 @@ function App() {
                   </Button>
                 </Form>
                 <div className="d-flex gap-2 flex-wrap">
+                  <Button
+                    variant={darkMode ? "outline-danger" : "danger"}
+                    onClick={clearHistory}
+                    disabled={!selectedPdf || currentChat.length === 0}
+                    title="Clear conversation history"
+                  >
+                    🗑️ Clear History
+                  </Button>
                   <Button
                     variant={darkMode ? "outline-warning" : "warning"}
                     onClick={summarizePDF}

@@ -62,10 +62,11 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
 
 // Route: Ask Question
 app.post("/ask", askLimiter, async (req, res) => {
-  const { question } = req.body;
+  const { question, history } = req.body;
   try {
     const response = await axios.post("http://localhost:5000/ask", {
       question,
+      history: history || [],
     });
 
     res.json({ answer: response.data.answer });
