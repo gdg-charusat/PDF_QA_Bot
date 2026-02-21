@@ -44,6 +44,14 @@ function App() {
   // Multi-PDF upload
   const uploadPDF = async () => {
     if (!file) return;
+    
+    // Client-side file size validation (10MB limit)
+    const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+    if (file.size > MAX_FILE_SIZE) {
+      alert(`File too large! Maximum size is 10MB. Your file is ${(file.size / (1024 * 1024)).toFixed(2)}MB`);
+      return;
+    }
+    
     setUploading(true);
     const formData = new FormData();
     formData.append("file", file);
@@ -54,8 +62,12 @@ function App() {
       setSelectedPdf(file.name);
       alert("PDF uploaded!");
     } catch (e) {
-      const message = e.response?.data?.error || "Upload failed.";
-      alert(message);
+      if (e.response?.status === 413) {
+        alert("File too large! Maximum file size is 10MB.");
+      } else {
+        const message = e.response?.data?.error || e.response?.data?.message || "Upload failed.";
+        alert(message);
+      }
     }
     setUploading(false);
   };
