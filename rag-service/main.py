@@ -107,9 +107,8 @@ def process_pdf(request: Request, data: PDFPath):
     if file_size > MAX_FILE_SIZE_BYTES:
         return {"error": f"File too large. Maximum size is {MAX_FILE_SIZE_BYTES // (1024 * 1024)}MB"}
     
-    # Validate file extension
-    if not data.filePath.lower().endswith('.pdf'):
-        return {"error": "Only PDF files are allowed"}
+    # Note: File type validation is done by Node.js server before upload
+    # Multer stores files without extension, so we skip extension check here
 
     loader = PyPDFLoader(data.filePath)
     docs = loader.load()
