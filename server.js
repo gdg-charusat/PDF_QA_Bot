@@ -48,9 +48,14 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
     const filePath = path.join(__dirname, req.file.path);
 
     // Send PDF to Python service
-    await axios.post("http://localhost:5000/process-pdf", {
+    const response = await axios.post("http://localhost:5000/process-pdf", {
       filePath: filePath,
+      filename: req.file.originalname,
     });
+
+    if (response.data.error) {
+      throw new Error(response.data.error);
+    }
 
     res.json({ message: "PDF uploaded & processed successfully!" });
   } catch (err) {
@@ -68,16 +73,26 @@ app.post("/ask", askLimiter, async (req, res) => {
       question,
     });
 
+    if (response.data.error) {
+      throw new Error(response.data.error);
+    }
+
     res.json({ answer: response.data.answer });
   } catch (err) {
-    console.error(err.message);
-    res.status(500).json({ error: "Error answering question" });
+    const details = err.response?.data || err.message;
+    console.error("Error answering question:", details);
+    res.status(500).json({ error: "Error answering question", details });
   }
 });
 
 app.post("/summarize", summarizeLimiter, async (req, res) => {
   try {
     const response = await axios.post("http://localhost:5000/summarize", req.body || {});
+
+    if (response.data.error) {
+      throw new Error(response.data.error);
+    }
+
     res.json({ summary: response.data.summary });
   } catch (err) {
     const details = err.response?.data || err.message;

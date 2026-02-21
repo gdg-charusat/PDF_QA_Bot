@@ -66,7 +66,7 @@ function App() {
     setAsking(true);
     setPdfs(prev => prev.map(pdf => pdf.name === selectedPdf ? { ...pdf, chat: [...pdf.chat, { role: "user", text: question }] } : pdf));
     try {
-      const res = await axios.post(`${API_BASE}/ask`, { question });
+      const res = await axios.post(`${API_BASE}/ask`, { question, filename: selectedPdf });
       setPdfs(prev => prev.map(pdf => pdf.name === selectedPdf ? { ...pdf, chat: [...pdf.chat, { role: "bot", text: res.data.answer }] } : pdf));
     } catch (e) {
       setPdfs(prev => prev.map(pdf => pdf.name === selectedPdf ? { ...pdf, chat: [...pdf.chat, { role: "bot", text: "Error getting answer." }] } : pdf));
@@ -97,10 +97,10 @@ function App() {
       const blob = new Blob([csv], { type: "text/csv" });
       saveAs(blob, `${selectedPdf}-chat.csv`);
     } else if (type === "pdf") {
-      // Simple text PDF export
+      // Simple text export (was incorrectly labeled .pdf)
       const text = chat.map(msg => `${msg.role}: ${msg.text}`).join("\n\n");
-      const blob = new Blob([text], { type: "application/pdf" });
-      saveAs(blob, `${selectedPdf}-chat.pdf`);
+      const blob = new Blob([text], { type: "text/plain" });
+      saveAs(blob, `${selectedPdf}-chat-export.txt`);
     }
   };
 
@@ -260,10 +260,10 @@ function App() {
                       <div key={i} className={`d-flex ${msg.role === "user" ? "justify-content-end" : "justify-content-start"} mb-2`}>
                         <div
                           className={`p-2 rounded ${msg.role === "user"
-                              ? "bg-primary text-light"
-                              : darkMode
-                                ? "bg-dark text-light border border-secondary"
-                                : "bg-white text-dark border"
+                            ? "bg-primary text-light"
+                            : darkMode
+                              ? "bg-dark text-light border border-secondary"
+                              : "bg-white text-dark border"
                             }`}
                           style={{ maxWidth: "80%" }}
                         >

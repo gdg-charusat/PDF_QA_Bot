@@ -19,8 +19,7 @@ limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 
 # Temporary global variables
-vectorstore = None
-qa_chain = False
+vectorstores = {}  # filename -> vectorstore
 HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-base")
 generation_tokenizer = None
 generation_model = None
@@ -78,9 +77,11 @@ def generate_response(prompt: str, max_new_tokens: int) -> str:
 
 class PDFPath(BaseModel):
     filePath: str
+    filename: str | None = None
 
 class Question(BaseModel):
     question: str
+    filename: str | None = None
 
 
 class SummarizeRequest(BaseModel):
@@ -89,30 +90,38 @@ class SummarizeRequest(BaseModel):
 @app.post("/process-pdf")
 @limiter.limit("15/15 minutes")
 def process_pdf(data: PDFPath):
-    global vectorstore, qa_chain
+    global vectorstores
 
+    filename = data.filename or os.path.basename(data.filePath)
+    
     loader = PyPDFLoader(data.filePath)
     docs = loader.load()
 
     splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
     chunks = splitter.split_documents(docs)
     if not chunks:
-            return {"error": "No text chunks generated from the PDF. Please check your file."}
-    vectorstore = FAISS.from_documents(chunks, embedding_model)
+        return {"error": "No text chunks generated from the PDF. Please check your file."}
+    
+    vectorstores[filename] = FAISS.from_documents(chunks, embedding_model)
 
-    qa_chain = True  # Just a flag to indicate PDF is processed
-
-    return {"message": "PDF processed successfully"}
+    return {"message": f"PDF '{filename}' processed successfully"}
 
 
 @app.post("/ask")
 @limiter.limit("60/15 minutes")
 def ask_question(data: Question):
-    global vectorstore, qa_chain
-    if not qa_chain:
-        return {"answer": "Please upload a PDF first!"}
+    global vectorstores
+    
+    # Fallback to last uploaded if filename not specified
+    filename = data.filename
+    if not filename and vectorstores:
+        filename = list(vectorstores.keys())[-1]
+        
+    if not filename or filename not in vectorstores:
+        return {"error": "Please upload the PDF first or specify the correct filename!"}
 
-    docs = vectorstore.similarity_search(data.question, k=4)
+    vs = vectorstores[filename]
+    docs = vs.similarity_search(data.question, k=4)
     if not docs:
         return {"answer": "No relevant context found."}
 
@@ -132,12 +141,18 @@ def ask_question(data: Question):
 
 @app.post("/summarize")
 @limiter.limit("15/15 minutes")
-def summarize_pdf(_: SummarizeRequest):
-    global vectorstore, qa_chain
-    if not qa_chain:
-        return {"summary": "Please upload a PDF first!"}
+def summarize_pdf(data: SummarizeRequest):
+    global vectorstores
+    
+    filename = data.pdf
+    if not filename and vectorstores:
+        filename = list(vectorstores.keys())[-1]
 
-    docs = vectorstore.similarity_search("Give a concise summary of the document.", k=6)
+    if not filename or filename not in vectorstores:
+        return {"error": "Please upload the PDF first or specify the correct filename!"}
+
+    vs = vectorstores[filename]
+    docs = vs.similarity_search("Give a concise summary of the document.", k=6)
     if not docs:
         return {"summary": "No document context available to summarize."}
 
