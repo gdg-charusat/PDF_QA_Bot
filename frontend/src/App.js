@@ -54,7 +54,12 @@ function App() {
       setSelectedPdf(file.name);
       alert("PDF uploaded!");
     } catch (e) {
-      const message = e.response?.data?.error || "Upload failed.";
+      let message = e.response?.data?.error || "Upload failed.";
+      if (e.code === "ERR_NETWORK" || e.message?.includes("Network Error")) {
+        message = "Cannot connect to server. Make sure the API gateway (port 4000) and RAG service (port 5000) are running.";
+      } else if (e.response?.data?.details) {
+        message += "\n\nDetails: " + (typeof e.response.data.details === "string" ? e.response.data.details : JSON.stringify(e.response.data.details));
+      }
       alert(message);
     }
     setUploading(false);

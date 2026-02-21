@@ -35,8 +35,16 @@ const summarizeLimiter = rateLimit({
   legacyHeaders: false,
 });
 
-// Storage for uploaded PDFs
-const upload = multer({ dest: "uploads/" });
+// Storage for uploaded PDFs - preserve .pdf extension for RAG service
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    const dir = path.join(__dirname, "uploads");
+    if (!require("fs").existsSync(dir)) require("fs").mkdirSync(dir, { recursive: true });
+    cb(null, dir);
+  },
+  filename: (req, file, cb) => cb(null, Date.now() + "-" + Math.random().toString(36).slice(2) + ".pdf"),
+});
+const upload = multer({ storage });
 
 // Route: Upload PDF
 app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
@@ -45,7 +53,7 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
       return res.status(400).json({ error: "No file uploaded. Use form field name 'file'." });
     }
 
-    const filePath = path.join(__dirname, req.file.path);
+    const filePath = path.join(req.file.destination, req.file.filename);
 
     // Send PDF to Python service
     await axios.post("http://localhost:5000/process-pdf", {
@@ -54,9 +62,10 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
 
     res.json({ message: "PDF uploaded & processed successfully!" });
   } catch (err) {
-    const details = err.response?.data || err.message;
+    const details = err.response?.data?.detail || err.response?.data || err.message;
+    const msg = typeof details === "string" ? details : "PDF processing failed";
     console.error("Upload processing failed:", details);
-    res.status(500).json({ error: "PDF processing failed", details });
+    res.status(err.response?.status || 500).json({ error: msg, details });
   }
 });
 

@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -21,13 +21,20 @@ app.state.limiter = limiter
 # Temporary global variables
 vectorstore = None
 qa_chain = False
+# For better answers, set HF_GENERATION_MODEL=google/flan-t5-large in .env (needs ~3GB RAM)
 HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-base")
 generation_tokenizer = None
 generation_model = None
 generation_is_encoder_decoder = False
+_embedding_model = None
 
-# Load local embedding model
-embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+
+def get_embedding_model():
+    """Lazy load embedding model so server starts immediately."""
+    global _embedding_model
+    if _embedding_model is None:
+        _embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    return _embedding_model
 
 
 def load_generation_model():
@@ -94,33 +101,51 @@ class SummarizeRequest(BaseModel):
 
 @app.post("/process-pdf")
 @limiter.limit("15/15 minutes")
-def process_pdf(data: PDFPath):
+def process_pdf(request: Request, data: PDFPath):
     global vectorstore, qa_chain
 
-    loader = PyPDFLoader(data.filePath)
-    docs = loader.load()
+    import os
+    file_path = data.filePath
+    if not os.path.exists(file_path):
+        raise HTTPException(status_code=400, detail=f"File not found: {file_path}")
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-    chunks = splitter.split_documents(docs)
+    try:
+        loader = PyPDFLoader(file_path)
+        docs = loader.load()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to load PDF: {str(e)}")
+
+    if not docs:
+        raise HTTPException(status_code=400, detail="No text could be extracted from the PDF. The file may be empty or corrupted.")
+
+    try:
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+        chunks = splitter.split_documents(docs)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to split document: {str(e)}")
+
     if not chunks:
-            return {"error": "No text chunks generated from the PDF. Please check your file."}
-    vectorstore = FAISS.from_documents(chunks, embedding_model)
+        raise HTTPException(status_code=400, detail="No text chunks generated from the PDF. Please check your file.")
+
+    try:
+        vectorstore = FAISS.from_documents(chunks, get_embedding_model())
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to process PDF (embedding): {str(e)}")
 
     qa_chain = True  # Just a flag to indicate PDF is processed
-
     return {"message": "PDF processed successfully"}
 
 
 @app.post("/ask")
 @limiter.limit("60/15 minutes")
-def ask_question(data: Question):
+def ask_question(request: Request, data: Question):
     global vectorstore, qa_chain
     if not qa_chain:
         return {"answer": "Please upload a PDF first!"}
 
-    docs = vectorstore.similarity_search(data.question, k=4)
+    docs = vectorstore.similarity_search(data.question, k=6)
     if not docs:
-        return {"answer": "No relevant context found."}
+        return {"answer": "I couldn't find relevant information in the document for your question. Try rephrasing or asking about a different topic covered in the PDF."}
 
     context = "\n\n".join([doc.page_content for doc in docs])
 
@@ -137,40 +162,50 @@ def ask_question(data: Question):
         )
 
     prompt = (
-        "You are a helpful assistant for question answering over PDF documents. "
-        "Use the provided context and previous conversation for context. "
-        "If the context does not contain the answer, say so briefly.\n\n"
-        f"Context:\n{context}\n\n"
+        "You are a friendly, expert assistant that helps users understand their PDF documents. "
+        "Give clear, helpful, and user-friendly answers. Follow these guidelines:\n"
+        "- Answer in plain language; avoid jargon unless necessary\n"
+        "- Structure answers with bullet points or numbered steps when listing multiple items\n"
+        "- Provide actionable solutions or next steps when the user asks how to do something\n"
+        "- If information is in the document, cite it; if not found, politely say so and suggest rephrasing\n"
+        "- Use the previous conversation to understand follow-up questions and maintain context\n"
+        "- Keep answers concise but complete; prioritize what the user needs to know\n\n"
+        "Document content:\n"
+        f"{context}\n\n"
         f"{history_text}"
-        f"Question: {data.question}\n"
-        "Answer:"
+        f"User question: {data.question}\n\n"
+        "Provide a helpful, user-friendly answer:"
     )
 
-    answer = generate_response(prompt, max_new_tokens=256)
+    answer = generate_response(prompt, max_new_tokens=384)
     return {"answer": answer}
 
 
 @app.post("/summarize")
 @limiter.limit("15/15 minutes")
-def summarize_pdf(_: SummarizeRequest):
+def summarize_pdf(request: Request, _: SummarizeRequest):
     global vectorstore, qa_chain
     if not qa_chain:
         return {"summary": "Please upload a PDF first!"}
 
-    docs = vectorstore.similarity_search("Give a concise summary of the document.", k=6)
+    docs = vectorstore.similarity_search("Give a comprehensive summary of the document including main topics, key points, and important details.", k=8)
     if not docs:
-        return {"summary": "No document context available to summarize."}
+        return {"summary": "No document content available to summarize."}
 
     context = "\n\n".join([doc.page_content for doc in docs])
     prompt = (
-        "Summarize the following document content in 6-8 concise bullet points.\n\n"
-        f"Context:\n{context}\n\n"
+        "Create a clear, user-friendly summary of this document. Include:\n"
+        "- Main topic or purpose (1-2 sentences)\n"
+        "- Key points as bullet points\n"
+        "- Important details, steps, or recommendations if present\n"
+        "Use plain language. Make it easy for the reader to quickly understand what the document covers.\n\n"
+        f"Document content:\n{context}\n\n"
         "Summary:"
     )
 
-    summary = generate_response(prompt, max_new_tokens=220)
+    summary = generate_response(prompt, max_new_tokens=320)
     return {"summary": summary}
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=5000)
