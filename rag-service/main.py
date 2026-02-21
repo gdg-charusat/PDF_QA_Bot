@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from pydantic import BaseModel
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -17,6 +17,10 @@ load_dotenv()
 app = FastAPI()
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
+
+@app.get("/")
+def health_check():
+    return {"status": "ok", "message": "RAG Service is running"}
 
 # Temporary global variables
 vectorstore = None
@@ -86,10 +90,26 @@ class Question(BaseModel):
 class SummarizeRequest(BaseModel):
     pdf: str | None = None
 
+# File size limit: 10MB
+MAX_FILE_SIZE_BYTES = 10 * 1024 * 1024  # 10MB
+
 @app.post("/process-pdf")
 @limiter.limit("15/15 minutes")
-def process_pdf(data: PDFPath):
+def process_pdf(request: Request, data: PDFPath):
     global vectorstore, qa_chain
+
+    # Validate file exists
+    if not os.path.exists(data.filePath):
+        return {"error": "File not found"}
+    
+    # Validate file size
+    file_size = os.path.getsize(data.filePath)
+    if file_size > MAX_FILE_SIZE_BYTES:
+        return {"error": f"File too large. Maximum size is {MAX_FILE_SIZE_BYTES // (1024 * 1024)}MB"}
+    
+    # Validate file extension
+    if not data.filePath.lower().endswith('.pdf'):
+        return {"error": "Only PDF files are allowed"}
 
     loader = PyPDFLoader(data.filePath)
     docs = loader.load()
@@ -107,7 +127,7 @@ def process_pdf(data: PDFPath):
 
 @app.post("/ask")
 @limiter.limit("60/15 minutes")
-def ask_question(data: Question):
+def ask_question(request: Request, data: Question):
     global vectorstore, qa_chain
     if not qa_chain:
         return {"answer": "Please upload a PDF first!"}
@@ -132,7 +152,7 @@ def ask_question(data: Question):
 
 @app.post("/summarize")
 @limiter.limit("15/15 minutes")
-def summarize_pdf(_: SummarizeRequest):
+def summarize_pdf(request: Request, _: SummarizeRequest):
     global vectorstore, qa_chain
     if not qa_chain:
         return {"summary": "Please upload a PDF first!"}
