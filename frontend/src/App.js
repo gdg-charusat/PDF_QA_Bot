@@ -52,12 +52,22 @@ function App() {
       const url = URL.createObjectURL(file);
       setPdfs(prev => [...prev, { name: file.name, url, chat: [] }]);
       setSelectedPdf(file.name);
-      alert("PDF uploaded!");
+      alert("PDF uploaded successfully!");
     } catch (e) {
-      const message = e.response?.data?.error || "Upload failed.";
-      alert(message);
+      let errorMessage = "Upload failed.";
+      
+      if (e.response?.data?.error) {
+        errorMessage = e.response.data.error;
+      } else if (e.response?.data?.detail) {
+        errorMessage = e.response.data.detail;
+      } else if (e.message) {
+        errorMessage = e.message;
+      }
+      
+      alert(`❌ Error: ${errorMessage}`);
+    } finally {
+      setUploading(false);
     }
-    setUploading(false);
   };
 
   // Chat per PDF

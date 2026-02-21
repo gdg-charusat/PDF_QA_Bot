@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -11,6 +11,8 @@ import torch
 from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM
 from slowapi import Limiter
 from slowapi.util import get_remote_address
+from PyPDF2 import PdfReader
+from PyPDF2.errors import PdfReadError
 
 load_dotenv()
 
@@ -91,18 +93,61 @@ class SummarizeRequest(BaseModel):
 def process_pdf(data: PDFPath):
     global vectorstore, qa_chain
 
-    loader = PyPDFLoader(data.filePath)
-    docs = loader.load()
+    # Validate file exists
+    if not os.path.exists(data.filePath):
+        raise HTTPException(status_code=400, detail="File not found.")
+    
+    # Validate file size
+    file_size = os.path.getsize(data.filePath)
+    if file_size == 0:
+        raise HTTPException(status_code=400, detail="PDF file is empty.")
+    
+    # Validate PDF structure and readability
+    try:
+        pdf_reader = PdfReader(data.filePath)
+        if len(pdf_reader.pages) == 0:
+            raise HTTPException(status_code=400, detail="PDF has no pages.")
+        
+        # Check if PDF has readable text
+        has_text = False
+        for page in pdf_reader.pages[:3]:  # Check first 3 pages
+            if page.extract_text().strip():
+                has_text = True
+                break
+        
+        if not has_text:
+            raise HTTPException(status_code=400, detail="PDF has no readable text content. It may be scanned or image-based.")
+    
+    except PdfReadError:
+        raise HTTPException(status_code=400, detail="PDF file is corrupted or invalid.")
+    except Exception as e:
+        if "corrupted" in str(e).lower() or "invalid" in str(e).lower():
+            raise HTTPException(status_code=400, detail="PDF file is corrupted or invalid.")
+        raise HTTPException(status_code=500, detail=f"Error validating PDF: {str(e)}")
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-    chunks = splitter.split_documents(docs)
-    if not chunks:
-            return {"error": "No text chunks generated from the PDF. Please check your file."}
-    vectorstore = FAISS.from_documents(chunks, embedding_model)
+    # Process PDF
+    try:
+        loader = PyPDFLoader(data.filePath)
+        docs = loader.load()
+        
+        if not docs:
+            raise HTTPException(status_code=400, detail="Could not extract content from PDF.")
 
-    qa_chain = True  # Just a flag to indicate PDF is processed
+        splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+        chunks = splitter.split_documents(docs)
+        
+        if not chunks:
+            raise HTTPException(status_code=400, detail="No text content found in PDF.")
+        
+        vectorstore = FAISS.from_documents(chunks, embedding_model)
+        qa_chain = True
 
-    return {"message": "PDF processed successfully"}
+        return {"message": "PDF processed successfully"}
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
 
 
 @app.post("/ask")
