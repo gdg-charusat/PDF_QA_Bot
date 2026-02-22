@@ -44,6 +44,7 @@ function App() {
   const uploadPDF = async () => {
     if (!file) return;
     setUploading(true);
+    setProcessingPdf(true);
     const formData = new FormData();
     formData.append("file", file);
     try {

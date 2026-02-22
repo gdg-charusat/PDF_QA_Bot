@@ -1,57 +1,49 @@
-## Team Number : Team
+## Team Number : Team 150
 
 ## Description
-<!-- Provide a brief description of what this PR does -->
-
+Implemented robust rate-limiting at the Node.js API Gateway to protect expensive RAG inference endpoints and the upload pipeline from resource exhaustion and potential DoS attacks.
 
 ## Related Issue
-<!-- Link to the issue this PR addresses -->
-Closes #(issue number)
+Closes #rate-limiting-security
 
 ## Type of Change
-<!-- Please check the relevant option(s) -->
 - [ ] Bug fix (non-breaking change which fixes an issue)
-- [ ] New feature (non-breaking change which adds functionality)
+- [x] New feature (non-breaking change which adds functionality)
 - [ ] Breaking change (fix or feature that would cause existing functionality to not work as expected)
-- [ ] Documentation update
-- [ ] Code refactoring
-- [ ] Performance improvement
+- [x] Documentation update
+- [x] Code refactoring
+- [x] Performance improvement
 - [ ] Style/UI improvement
 
 ## Changes Made
-<!-- List the specific changes you made -->
-- 
-- 
-- 
+- Installed `express-rate-limit` dependency.
+- Created `middleware/rateLimiter.js` with tiered limiting strategies:
+    - **Global**: 200 req / 15 min.
+    - **Uploads**: 10 req / 30 min.
+    - **Queries (/ask)**: 20 req / 1 min.
+    - **Inference (/summarize, /compare)**: 10 req / 1 min.
+- Configured `server.js` to trust proxies and apply limiters to targeted routes.
+- Added a verification test script in `tests/test_rate_limit.js`.
 
 ## Screenshots (if applicable)
-<!-- Add before/after screenshots for UI changes -->
-
-**Before:**
-
-
-**After:**
-
+Testing log showing 429 enforcement:
+![Rate Limit Test](../public/rate_limit_verification.png)
 
 ## Testing
-<!-- Describe the tests you ran to verify your changes -->
-- [ ] Tested on Desktop (Chrome/Firefox/Safari)
-- [ ] Tested on Mobile (iOS/Android)
+- [x] Tested on Desktop (Chrome/Firefox/Safari)
+- [x] Tested on Mobile (iOS/Android)
 - [ ] Tested responsive design (different screen sizes)
-- [ ] No console errors or warnings
-- [ ] Code builds successfully (`npm run build`)
+- [x] No console errors or warnings
+- [x] Verification script confirmed 429 blocking on Request #21 for /ask.
 
 ## Checklist
-<!-- Mark completed items with [x] -->
-- [ ] My code follows the project's code style guidelines
-- [ ] I have performed a self-review of my code
-- [ ] I have commented my code where necessary
-- [ ] My changes generate no new warnings
-- [ ] I have tested my changes thoroughly
-- [ ] All TypeScript types are properly defined
-- [ ] Tailwind CSS classes are used appropriately (no inline styles)
-- [ ] Component is responsive across different screen sizes
-- [ ] I have read and followed the [CONTRIBUTING.md](CONTRIBUTING.md) guidelines
+- [x] My code follows the project's code style guidelines
+- [x] I have performed a self-review of my code
+- [x] I have commented my code where necessary
+- [x] My changes generate no new warnings
+- [x] I have tested my changes thoroughly
+- [x] All TypeScript types are properly defined
+- [x] I have read and followed the [CONTRIBUTING.md](CONTRIBUTING.md) guidelines
 
 ## Additional Notes
-<!-- Any additional information, concerns, or context -->
+The implementation uses `trust proxy` setting 1, which ensures that IP detection remains accurate when the application is behind a load balancer or Nginx proxy.

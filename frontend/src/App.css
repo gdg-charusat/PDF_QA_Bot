@@ -50,6 +50,18 @@
   background-color: rgba(0, 0, 0, 0.05);
 }
 
+/* PDF Status Alerts */
+.alert-info {
+  border-left: 4px solid #17a2b8;
+  border-radius: 8px;
+  transition: all 0.3s ease;
+}
+
+.alert-info:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
 .theme-toggle-group {
   border-radius: 6px;
   overflow: hidden;
