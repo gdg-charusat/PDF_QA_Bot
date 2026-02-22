@@ -36,6 +36,81 @@ function App() {
   const [darkMode, setDarkMode] = useState(false);
 
   // ===============================
+  // localStorage Helper Functions
+  // ===============================
+  const isLocalStorageAvailable = () => {
+    try {
+      const test = "__localStorage_test__";
+      localStorage.setItem(test, test);
+      localStorage.removeItem(test);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  // Load from localStorage on mount
+  useEffect(() => {
+    if (!isLocalStorageAvailable()) return;
+
+    const savedChatHistory = localStorage.getItem("chatHistory");
+    const savedPdfs = localStorage.getItem("pdfs");
+
+    if (savedChatHistory) {
+      try {
+        setChatHistory(JSON.parse(savedChatHistory));
+      } catch (err) {
+        console.error("Error loading chat history:", err);
+      }
+    }
+
+    if (savedPdfs) {
+      try {
+        setPdfs(JSON.parse(savedPdfs));
+      } catch (err) {
+        console.error("Error loading PDFs:", err);
+      }
+    }
+  }, []);
+
+  // Save chatHistory to localStorage whenever it changes
+  useEffect(() => {
+    if (!isLocalStorageAvailable()) return;
+    try {
+      localStorage.setItem("chatHistory", JSON.stringify(chatHistory));
+    } catch (err) {
+      console.error("Error saving chat history:", err);
+    }
+  }, [chatHistory]);
+
+  // Save pdfs to localStorage whenever it changes
+  useEffect(() => {
+    if (!isLocalStorageAvailable()) return;
+    try {
+      localStorage.setItem("pdfs", JSON.stringify(pdfs));
+    } catch (err) {
+      console.error("Error saving PDFs:", err);
+    }
+  }, [pdfs]);
+
+  // Clear history function
+  const clearHistory = () => {
+    if (window.confirm("Are you sure you want to clear all chat history and uploads?")) {
+      setChatHistory([]);
+      setPdfs([]);
+      setSelectedDocs([]);
+      if (isLocalStorageAvailable()) {
+        try {
+          localStorage.removeItem("chatHistory");
+          localStorage.removeItem("pdfs");
+        } catch (err) {
+          console.error("Error clearing localStorage:", err);
+        }
+      }
+    }
+  };
+
+  // ===============================
   // Upload
   // ===============================
   const uploadPDF = async () => {
@@ -175,11 +250,16 @@ function App() {
   return (
     <div className={themeClass} style={{ minHeight: "100vh" }}>
       <Navbar bg={darkMode ? "dark" : "primary"} variant="dark">
-        <Container>
+        <Container className="d-flex justify-content-between align-items-center">
           <Navbar.Brand>PDF Q&A Bot</Navbar.Brand>
-          <Button variant="outline-light" onClick={() => setDarkMode(!darkMode)}>
-            Toggle Theme
-          </Button>
+          <div className="d-flex gap-2">
+            <Button variant="outline-light" onClick={() => setDarkMode(!darkMode)}>
+              Toggle Theme
+            </Button>
+            <Button variant="outline-danger" onClick={clearHistory}>
+              Clear History
+            </Button>
+          </div>
         </Container>
       </Navbar>
 
