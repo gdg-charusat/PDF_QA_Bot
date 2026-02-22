@@ -116,8 +116,28 @@ def process_pdf(data: PDFPath):
     if not os.path.exists(data.filePath):
         return {"error": "File not found."}
 
-    loader = PyPDFLoader(data.filePath)
-    docs = loader.load()
+    # Check file size
+    file_size = os.path.getsize(data.filePath)
+    if file_size == 0:
+        return {"error": "PDF file is empty."}
+    
+    if file_size > 10 * 1024 * 1024:  # 10MB limit
+        return {"error": "PDF file exceeds 10MB size limit."}
+
+    try:
+        loader = PyPDFLoader(data.filePath)
+        docs = loader.load()
+    except Exception as e:
+        return {"error": f"Failed to read PDF. The file may be corrupted or password-protected: {str(e)}"}
+
+    # Validate PDF has content
+    if not docs:
+        return {"error": "PDF has no pages or is corrupted."}
+    
+    # Check if PDF has readable text
+    total_text = "".join([doc.page_content for doc in docs]).strip()
+    if not total_text or len(total_text) < 10:
+        return {"error": "PDF has no readable text content. It may be image-based or corrupted."}
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=1000,

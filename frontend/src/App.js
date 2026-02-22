@@ -41,6 +41,23 @@ function App() {
   const uploadPDF = async () => {
     if (!file) return;
 
+    // Validate file type
+    if (file.type !== "application/pdf") {
+      alert("Please upload a valid PDF file.");
+      return;
+    }
+
+    // Validate file size (10MB limit)
+    const MAX_SIZE = 10 * 1024 * 1024; // 10MB
+    if (file.size === 0) {
+      alert("The selected PDF file is empty. Please choose a valid PDF.");
+      return;
+    }
+    if (file.size > MAX_SIZE) {
+      alert(`File size exceeds 10MB limit. Please upload a smaller PDF file.`);
+      return;
+    }
+
     setUploading(true);
     const formData = new FormData();
     formData.append("file", file);
@@ -55,9 +72,10 @@ function App() {
       ]);
 
       setFile(null);
-      alert("PDF uploaded!");
-    } catch {
-      alert("Upload failed.");
+      alert("PDF uploaded successfully!");
+    } catch (err) {
+      const errorMsg = err.response?.data?.error || "Upload failed. The PDF may be corrupted or unreadable.";
+      alert(errorMsg);
     }
 
     setUploading(false);
@@ -189,7 +207,11 @@ function App() {
         <Card className="mb-4">
           <Card.Body>
             <Form>
-              <Form.Control type="file" onChange={e => setFile(e.target.files[0])} />
+              <Form.Control 
+                type="file" 
+                accept=".pdf,application/pdf"
+                onChange={e => setFile(e.target.files[0])} 
+              />
               <Button
                 className="mt-2"
                 onClick={uploadPDF}
@@ -197,6 +219,9 @@ function App() {
               >
                 {uploading ? <Spinner size="sm" animation="border" /> : "Upload"}
               </Button>
+              <Form.Text className="text-muted d-block mt-2">
+                Upload PDF files only (Max 10MB)
+              </Form.Text>
             </Form>
           </Card.Body>
         </Card>
