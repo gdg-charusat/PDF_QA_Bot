@@ -16,10 +16,17 @@
 
   "keywords": [],
 
+  "description": "PDF Question Answering Bot using Express",
+  "main": "index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
+  "keywords": ["pdf", "qa", "bot", "express"],
   "author": "",
 
   "license": "ISC",
-
   "type": "commonjs",
 
   "dependencies": {
