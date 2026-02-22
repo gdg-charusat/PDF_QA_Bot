@@ -9,7 +9,12 @@ from dotenv import load_dotenv
 import os
 import uvicorn
 import torch
-from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM
+from transformers import (
+    AutoConfig,
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,
+    AutoModelForCausalLM,
+)
 from uuid import uuid4
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
@@ -18,58 +23,44 @@ from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 # Authentication imports
-from database import engine, get_db
+from database import engine
 from auth.models import Base, User
 from auth.router import router as auth_router
 from auth.middleware import (
-    get_current_user, 
-    get_optional_user,
     require_upload_permission,
     require_ask_permission,
     require_summarize_permission,
     require_compare_permission,
-    require_view_documents_permission
+    require_view_documents_permission,
 )
 
 load_dotenv()
 
-# ===============================
-# APP INITIALIZATION 
-# ===============================
 app = FastAPI(
     title="PDF QA Bot API",
     description="Secure PDF Question-Answering Bot with Authentication",
-    version="2.0.0"
+    version="2.0.0",
 )
 
-# CORS middleware for frontend integration
+# CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ===============================
-# DATABASE INITIALIZATION
-# ===============================
-# Create database tables
-Base.metadata.create_all(bind=engine)
 
-# Include authentication router
+Base.metadata.create_all(bind=engine)
 app.include_router(auth_router)
 
-# ===============================
-# RATE LIMITING SETUP 
-# ===============================
+
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# ===============================
-# GLOBAL STATE (Multi-document support from remote)
-# ===============================
+
 VECTOR_STORE = None
 DOCUMENT_REGISTRY = {}
 DOCUMENT_EMBEDDINGS = {}
@@ -80,16 +71,24 @@ generation_tokenizer = None
 generation_model = None
 generation_is_encoder_decoder = False
 
-# ===============================
-# EMBEDDING MODEL
-# ===============================
+# Embedding model
 embedding_model = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
 
-# ===============================
-# MODEL LOADING
-# ===============================
+class Question(BaseModel):
+    question: str
+    doc_ids: list[str] | None = None
+
+
+class SummarizeRequest(BaseModel):
+    doc_ids: list[str] | None = None
+
+
+class CompareRequest(BaseModel):
+    doc_ids: list[str]
+
+
 def load_generation_model():
     global generation_tokenizer, generation_model, generation_is_encoder_decoder
 
@@ -97,7 +96,9 @@ def load_generation_model():
         return generation_tokenizer, generation_model, generation_is_encoder_decoder
 
     config = AutoConfig.from_pretrained(HF_GENERATION_MODEL)
-    generation_is_encoder_decoder = bool(getattr(config, "is_encoder_decoder", False))
+    generation_is_encoder_decoder = bool(
+        getattr(config, "is_encoder_decoder", False)
+    )
     generation_tokenizer = AutoTokenizer.from_pretrained(HF_GENERATION_MODEL)
 
     if generation_is_encoder_decoder:
@@ -118,119 +119,19 @@ def generate_response(prompt: str, max_new_tokens: int) -> str:
 
     encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
     encoded = {k: v.to(device) for k, v in encoded.items()}
-    pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
 
     with torch.no_grad():
-        output_ids = model.generate(
-            **encoded,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=pad_token_id,
-        )
+        output = model.generate(**encoded, max_new_tokens=max_new_tokens)
 
     if is_encoder_decoder:
-        return tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
+        return tokenizer.decode(output[0], skip_special_tokens=True).strip()
 
     input_len = encoded["input_ids"].shape[1]
-    new_tokens = output_ids[0][input_len:]
+    new_tokens = output[0][input_len:]
     return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
 
 
-# ===============================
-# REQUEST MODELS
-# ===============================
-class PDFPath(BaseModel):
-    filePath: str
-
-
-class Question(BaseModel):
-    question: str
-    doc_ids: list[str] | None = None
-
-
-class SummarizeRequest(BaseModel):
-    doc_ids: list[str] | None = None
-
-
-class CompareRequest(BaseModel):
-    doc_ids: list[str]
-
-
-# ===============================
-# UPLOAD ENDPOINT (Expected by frontend)
-# ===============================
-@app.post("/upload") 
-@limiter.limit("10/15 minutes")
-async def upload_file(
-    request: Request, 
-    file: UploadFile = File(...),
-    current_user: User = Depends(require_upload_permission)
-):
-    """Upload and process PDF file (Authentication required)"""
-    if not file.filename.lower().endswith('.pdf'):
-        return {"error": "Only PDF files are supported"}
-    
-    # Save uploaded file temporarily
-    upload_dir = "uploads"
-    os.makedirs(upload_dir, exist_ok=True)
-    file_path = os.path.join(upload_dir, f"{uuid4().hex}_{file.filename}")
-    
-    try:
-        with open(file_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
-        
-        # Process the PDF
-        result = process_pdf_internal(file_path)
-        
-        # Add user info to the result for audit trail
-        if result and "doc_id" in result:
-            result["uploaded_by"] = current_user.username
-            result["user_id"] = current_user.id
-        
-        # Clean up temporary file (optional - you may want to keep it)
-        # os.remove(file_path)
-        
-        return result
-        
-    except Exception as e:
-        return {"error": f"Upload failed: {str(e)}"}
-
-# Optional: Legacy endpoint for backward compatibility (will be deprecated)
-@app.post("/upload/anonymous", deprecated=True) 
-@limiter.limit("5/15 minutes")  # More restrictive rate limit for anonymous users
-async def upload_file_anonymous(
-    request: Request, 
-    file: UploadFile = File(...)
-):
-    """Upload and process PDF file (Anonymous - Deprecated)"""
-    import warnings
-    warnings.warn("Anonymous upload is deprecated. Please use authenticated endpoint.", DeprecationWarning)
-    
-    if not file.filename.lower().endswith('.pdf'):
-        return {"error": "Only PDF files are supported"}
-    
-    # Save uploaded file temporarily
-    upload_dir = "uploads"
-    os.makedirs(upload_dir, exist_ok=True)  
-    file_path = os.path.join(upload_dir, f"{uuid4().hex}_{file.filename}")
-    
-    try:
-        with open(file_path, "wb") as buffer:
-            content = await file.read()
-            buffer.write(content)
-        
-        # Process the PDF
-        result = process_pdf_internal(file_path)
-        
-        return result
-        
-    except Exception as e:
-        return {"error": f"Upload failed: {str(e)}"}
-
-
 def process_pdf_internal(file_path: str):
-    """Internal function to process PDF without rate limiting"""
     global VECTOR_STORE, DOCUMENT_REGISTRY, DOCUMENT_EMBEDDINGS
 
     if not os.path.exists(file_path):
@@ -240,112 +141,76 @@ def process_pdf_internal(file_path: str):
     docs = loader.load()
 
     splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=100
+        chunk_size=1000, chunk_overlap=100
     )
     chunks = splitter.split_documents(docs)
 
     if not chunks:
-        return {"error": "No text chunks generated from the PDF."}
+        return {"error": "No text extracted from PDF."}
 
+    # Attach doc_id metadata
     doc_id = str(uuid4())
-    filename = os.path.basename(file_path)
-
     for chunk in chunks:
-        chunk.metadata = {
-            "doc_id": doc_id,
-            "filename": filename
-        }
+        chunk.metadata["doc_id"] = doc_id
 
+    # Build / update vector store
     if VECTOR_STORE is None:
         VECTOR_STORE = FAISS.from_documents(chunks, embedding_model)
     else:
         VECTOR_STORE.add_documents(chunks)
 
+    # Document registry
+    filename = os.path.basename(file_path)
+    DOCUMENT_REGISTRY[doc_id] = {
+        "filename": filename,
+        "num_chunks": len(chunks),
+    }
+
+    # Document embedding (for similarity)
     embeddings = embedding_model.embed_documents(
         [c.page_content for c in chunks]
     )
-    doc_vector = np.mean(embeddings, axis=0)
-    DOCUMENT_EMBEDDINGS[doc_id] = doc_vector
-
-    DOCUMENT_REGISTRY[doc_id] = {
-        "filename": filename,
-        "num_chunks": len(chunks)
-    }
+    DOCUMENT_EMBEDDINGS[doc_id] = np.mean(embeddings, axis=0)
 
     return {
         "message": "PDF processed successfully",
-        "doc_id": doc_id
+        "doc_id": doc_id,
     }
 
 
-# ===============================
-# PROCESS PDF (MULTI-DOC SUPPORT + RATE LIMITING)
-# ===============================
-@app.post("/process-pdf")
-@limiter.limit("15/15 minutes")
-def process_pdf(
-    request: Request, 
-    data: PDFPath,
-    current_user: User = Depends(require_upload_permission)
+@app.post("/upload")
+@limiter.limit("10/15 minutes")
+async def upload_file(
+    request: Request,
+    file: UploadFile = File(...),
+    current_user: User = Depends(require_upload_permission),
 ):
-    """Process PDF from file path (Authentication required)"""
-    result = process_pdf_internal(data.filePath)
-    
-    # Add user info to the result for audit trail
-    if result and "doc_id" in result:
-        result["processed_by"] = current_user.username
-        result["user_id"] = current_user.id
-    
-    return result
+    if not file.filename.lower().endswith(".pdf"):
+        return {"error": "Only PDF files are supported"}
+
+    upload_dir = "uploads"
+    os.makedirs(upload_dir, exist_ok=True)
+    file_path = os.path.join(upload_dir, f"{uuid4().hex}_{file.filename}")
+
+    try:
+        with open(file_path, "wb") as buffer:
+            content = await file.read()
+            buffer.write(content)
+
+        result = process_pdf_internal(file_path)
+        result["uploaded_by"] = current_user.username
+        return result
+
+    except Exception as e:
+        return {"error": f"Upload failed: {str(e)}"}
 
 
-# ===============================
-# LIST DOCUMENTS
-# ===============================
-@app.get("/documents")
-def list_documents(current_user: User = Depends(require_view_documents_permission)):
-    """List all processed documents (Authentication required)"""
-    return {
-        "documents": DOCUMENT_REGISTRY,
-        "requested_by": current_user.username
-    }
-
-
-# ===============================
-# SIMILARITY MATRIX
-# ===============================
-@app.get("/similarity-matrix")
-def similarity_matrix(current_user: User = Depends(require_view_documents_permission)):
-    """Get similarity matrix between documents (Authentication required)"""
-    if len(DOCUMENT_EMBEDDINGS) < 2:
-        return {"error": "At least 2 documents required."}
-
-    doc_ids = list(DOCUMENT_EMBEDDINGS.keys())
-    vectors = np.array([DOCUMENT_EMBEDDINGS[d] for d in doc_ids])
-    sim_matrix = cosine_similarity(vectors)
-
-    result = {}
-    for i, doc_id in enumerate(doc_ids):
-        result[doc_id] = {}
-        for j, other_id in enumerate(doc_ids):
-            result[doc_id][other_id] = float(sim_matrix[i][j])
-
-    return {
-        "similarity_matrix": result,
-        "requested_by": current_user.username
-    }
-
-
-# ===============================
-# ASK QUESTION (MULTI-DOC FILTER + RATE LIMITING)
-# ===============================
 @app.post("/ask")
 @limiter.limit("60/15 minutes")
 def ask_question(
-    request: Request, 
+    request: Request,
     data: Question,
-    current_user: User = Depends(require_ask_permission)
+    current_user: User = Depends(require_ask_permission),
 ):
     global VECTOR_STORE
 
@@ -355,81 +220,64 @@ def ask_question(
     docs = VECTOR_STORE.similarity_search(data.question, k=10)
 
     if data.doc_ids:
-        docs = [d for d in docs if d.metadata.get("doc_id") in data.doc_ids]
+        docs = [
+            d for d in docs if d.metadata.get("doc_id") in data.doc_ids
+        ]
 
     if not docs:
         return {"answer": "No relevant context found."}
 
-    context = "\n\n".join([d.page_content for d in docs])
+    context = "\n\n".join([doc.page_content for doc in docs])
 
-    if data.doc_ids and len(data.doc_ids) > 1:
-        prompt = (
-            "You are an AI assistant comparing multiple documents.\n"
-            "Clearly structure your answer as:\n"
-            "- Similarities\n"
-            "- Differences\n"
-            "- Unique points per document\n\n"
-            f"Context:\n{context}\n\n"
-            f"Question: {data.question}\n"
-            "Answer:"
-        )
-    else:
-        prompt = (
-            "You are a helpful assistant answering questions about a PDF.\n"
-            "Use ONLY the provided context.\n\n"
-            f"Context:\n{context}\n\n"
-            f"Question: {data.question}\n"
-            "Answer:"
-        )
+    prompt = (
+        "You are a helpful assistant for PDF QA.\n"
+        f"Context:\n{context}\n\n"
+        f"Question: {data.question}\nAnswer:"
+    )
 
-    answer = generate_response(prompt, max_new_tokens=300)
+    answer = generate_response(prompt, max_new_tokens=256)
     return {"answer": answer}
 
 
-# ===============================
-# SUMMARIZE (MULTI-DOC + RATE LIMITING)
-# ===============================
 @app.post("/summarize")
 @limiter.limit("15/15 minutes")
 def summarize_pdf(
-    request: Request, 
+    request: Request,
     data: SummarizeRequest,
-    current_user: User = Depends(require_summarize_permission)
+    current_user: User = Depends(require_summarize_permission),
 ):
     global VECTOR_STORE
 
     if VECTOR_STORE is None:
-        return {"summary": "Please upload at least one PDF first!"}
+        return {"summary": "Please upload a PDF first!"}
 
-    docs = VECTOR_STORE.similarity_search("Summarize the document.", k=12)
-
-    if data.doc_ids:
-        docs = [d for d in docs if d.metadata.get("doc_id") in data.doc_ids]
-
-    if not docs:
-        return {"summary": "No document context available."}
-
-    context = "\n\n".join([d.page_content for d in docs])
-
-    prompt = (
-        "Summarize the content in 6-8 concise bullet points.\n\n"
-        f"Context:\n{context}\n\n"
-        "Summary:"
+    docs = VECTOR_STORE.similarity_search(
+        "Give a concise summary of the document.", k=8
     )
 
-    summary = generate_response(prompt, max_new_tokens=250)
+    if data.doc_ids:
+        docs = [
+            d for d in docs if d.metadata.get("doc_id") in data.doc_ids
+        ]
+
+    context = "\n\n".join([doc.page_content for doc in docs])
+
+    prompt = (
+        "Summarize the document in 6-8 bullet points.\n\n"
+        f"{context}\n\nSummary:"
+    )
+
+    summary = generate_response(prompt, max_new_tokens=220)
     return {"summary": summary}
 
 
-# ===============================
-# NEW: COMPARE SELECTED DOCUMENTS
-# ===============================
 @app.post("/compare")
+@limiter.limit("10/15 minutes")
 def compare_documents(
+    request: Request,
     data: CompareRequest,
-    current_user: User = Depends(require_compare_permission)
+    current_user: User = Depends(require_compare_permission),
 ):
-    """Compare selected documents (Authentication required)"""
     global VECTOR_STORE, DOCUMENT_REGISTRY
 
     if VECTOR_STORE is None:
@@ -438,16 +286,14 @@ def compare_documents(
     if len(data.doc_ids) < 2:
         return {"comparison": "Select at least 2 documents."}
 
-    # Pull more candidates
-    docs = VECTOR_STORE.similarity_search("Main topics and differences.", k=15)
-
-    # Filter safely
+    docs = VECTOR_STORE.similarity_search(
+        "Main topics and differences.", k=15
+    )
     docs = [d for d in docs if d.metadata.get("doc_id") in data.doc_ids]
 
     if not docs:
         return {"comparison": "No comparable content found."}
 
-    # Limit per document to avoid overload
     grouped = {}
     for d in docs:
         grouped.setdefault(d.metadata["doc_id"], []).append(d.page_content)
@@ -459,20 +305,14 @@ def compare_documents(
         context += f"\n\nDocument: {filename}\n{content}\n"
 
     prompt = (
-        "You are an expert AI that compares documents.\n"
-        "Provide a detailed comparison with:\n"
-        "1. Overall Themes\n"
-        "2. Key Similarities\n"
-        "3. Key Differences\n"
-        "4. Unique Strengths per Document\n\n"
-        f"{context}\n\n"
-        "Comparison:"
+        "Compare the documents with:\n"
+        "1. Overall Themes\n2. Similarities\n3. Differences\n4. Unique Points\n\n"
+        f"{context}\n\nComparison:"
     )
 
-    result = generate_response(prompt, max_new_tokens=600)
-
+    result = generate_response(prompt, max_new_tokens=500)
     return {"comparison": result}
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=5000)
+    uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=True)
