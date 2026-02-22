@@ -193,9 +193,6 @@ def cleanup_expired_sessions():
     for sid in expired:
         del sessions[sid]
 
-# -------------------------------------------------------------------
-# ENDPOINTS
-# -------------------------------------------------------------------
 @app.post("/process-pdf")
 @limiter.limit("15/15 minutes")
 def process_pdf(request: Request, data: PDFPath):
