@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Query
 from pydantic import BaseModel
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -18,11 +18,24 @@ load_dotenv()
 app = FastAPI()
 
 # ===============================
-# GLOBAL STATE
+# SESSION-SCOPED STATE
 # ===============================
-VECTOR_STORE = None
-DOCUMENT_REGISTRY = {}
-DOCUMENT_EMBEDDINGS = {}
+# Each session gets its own isolated vector store, document registry,
+# and document embeddings to prevent cross-user data leakage.
+# Structure: { session_id: { "vector_store": FAISS|None, "registry": {}, "embeddings": {} } }
+SESSION_STORES: dict[str, dict] = {}
+
+
+def get_session(session_id: str) -> dict:
+    """Get or create an isolated session store for the given session_id."""
+    if session_id not in SESSION_STORES:
+        SESSION_STORES[session_id] = {
+            "vector_store": None,
+            "registry": {},
+            "embeddings": {},
+        }
+    return SESSION_STORES[session_id]
+
 
 HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-small")
 
@@ -91,27 +104,35 @@ def generate_response(prompt: str, max_new_tokens: int) -> str:
 # ===============================
 class PDFPath(BaseModel):
     filePath: str
+    session_id: str
 
 
 class Question(BaseModel):
     question: str
+    session_id: str
     doc_ids: list[str] | None = None
 
 
 class SummarizeRequest(BaseModel):
+    session_id: str
     doc_ids: list[str] | None = None
 
 
 class CompareRequest(BaseModel):
+    session_id: str
     doc_ids: list[str]
 
 
+class CleanupRequest(BaseModel):
+    session_id: str
+
+
 # ===============================
-# PROCESS PDF (MULTI-DOC SUPPORT)
+# PROCESS PDF (SESSION-SCOPED)
 # ===============================
 @app.post("/process-pdf")
 def process_pdf(data: PDFPath):
-    global VECTOR_STORE, DOCUMENT_REGISTRY, DOCUMENT_EMBEDDINGS
+    session = get_session(data.session_id)
 
     if not os.path.exists(data.filePath):
         return {"error": "File not found."}
@@ -137,18 +158,18 @@ def process_pdf(data: PDFPath):
             "filename": filename
         }
 
-    if VECTOR_STORE is None:
-        VECTOR_STORE = FAISS.from_documents(chunks, embedding_model)
+    if session["vector_store"] is None:
+        session["vector_store"] = FAISS.from_documents(chunks, embedding_model)
     else:
-        VECTOR_STORE.add_documents(chunks)
+        session["vector_store"].add_documents(chunks)
 
     embeddings = embedding_model.embed_documents(
         [c.page_content for c in chunks]
     )
     doc_vector = np.mean(embeddings, axis=0)
-    DOCUMENT_EMBEDDINGS[doc_id] = doc_vector
+    session["embeddings"][doc_id] = doc_vector
 
-    DOCUMENT_REGISTRY[doc_id] = {
+    session["registry"][doc_id] = {
         "filename": filename,
         "num_chunks": len(chunks)
     }
@@ -160,23 +181,26 @@ def process_pdf(data: PDFPath):
 
 
 # ===============================
-# LIST DOCUMENTS
+# LIST DOCUMENTS (SESSION-SCOPED)
 # ===============================
 @app.get("/documents")
-def list_documents():
-    return DOCUMENT_REGISTRY
+def list_documents(session_id: str = Query(...)):
+    session = get_session(session_id)
+    return session["registry"]
 
 
 # ===============================
-# SIMILARITY MATRIX
+# SIMILARITY MATRIX (SESSION-SCOPED)
 # ===============================
 @app.get("/similarity-matrix")
-def similarity_matrix():
-    if len(DOCUMENT_EMBEDDINGS) < 2:
+def similarity_matrix(session_id: str = Query(...)):
+    session = get_session(session_id)
+
+    if len(session["embeddings"]) < 2:
         return {"error": "At least 2 documents required."}
 
-    doc_ids = list(DOCUMENT_EMBEDDINGS.keys())
-    vectors = np.array([DOCUMENT_EMBEDDINGS[d] for d in doc_ids])
+    doc_ids = list(session["embeddings"].keys())
+    vectors = np.array([session["embeddings"][d] for d in doc_ids])
     sim_matrix = cosine_similarity(vectors)
 
     result = {}
@@ -189,16 +213,16 @@ def similarity_matrix():
 
 
 # ===============================
-# ASK QUESTION (FIXED MULTI-DOC FILTER)
+# ASK QUESTION (SESSION-SCOPED)
 # ===============================
 @app.post("/ask")
 def ask_question(data: Question):
-    global VECTOR_STORE
+    session = get_session(data.session_id)
 
-    if VECTOR_STORE is None:
+    if session["vector_store"] is None:
         return {"answer": "Please upload at least one PDF first!"}
 
-    docs = VECTOR_STORE.similarity_search(data.question, k=10)
+    docs = session["vector_store"].similarity_search(data.question, k=10)
 
     if data.doc_ids:
         docs = [d for d in docs if d.metadata.get("doc_id") in data.doc_ids]
@@ -233,16 +257,16 @@ def ask_question(data: Question):
 
 
 # ===============================
-# SUMMARIZE
+# SUMMARIZE (SESSION-SCOPED)
 # ===============================
 @app.post("/summarize")
 def summarize_pdf(data: SummarizeRequest):
-    global VECTOR_STORE
+    session = get_session(data.session_id)
 
-    if VECTOR_STORE is None:
+    if session["vector_store"] is None:
         return {"summary": "Please upload at least one PDF first!"}
 
-    docs = VECTOR_STORE.similarity_search("Summarize the document.", k=12)
+    docs = session["vector_store"].similarity_search("Summarize the document.", k=12)
 
     if data.doc_ids:
         docs = [d for d in docs if d.metadata.get("doc_id") in data.doc_ids]
@@ -263,20 +287,20 @@ def summarize_pdf(data: SummarizeRequest):
 
 
 # ===============================
-# NEW: COMPARE SELECTED DOCUMENTS
+# COMPARE DOCUMENTS (SESSION-SCOPED)
 # ===============================
 @app.post("/compare")
 def compare_documents(data: CompareRequest):
-    global VECTOR_STORE, DOCUMENT_REGISTRY
+    session = get_session(data.session_id)
 
-    if VECTOR_STORE is None:
+    if session["vector_store"] is None:
         return {"comparison": "Upload documents first."}
 
     if len(data.doc_ids) < 2:
         return {"comparison": "Select at least 2 documents."}
 
     # Pull more candidates
-    docs = VECTOR_STORE.similarity_search("Main topics and differences.", k=15)
+    docs = session["vector_store"].similarity_search("Main topics and differences.", k=15)
 
     # Filter safely
     docs = [d for d in docs if d.metadata.get("doc_id") in data.doc_ids]
@@ -291,7 +315,7 @@ def compare_documents(data: CompareRequest):
 
     context = ""
     for doc_id in data.doc_ids:
-        filename = DOCUMENT_REGISTRY.get(doc_id, {}).get("filename", doc_id)
+        filename = session["registry"].get(doc_id, {}).get("filename", doc_id)
         content = "\n\n".join(grouped.get(doc_id, [])[:4])
         context += f"\n\nDocument: {filename}\n{content}\n"
 
@@ -309,6 +333,18 @@ def compare_documents(data: CompareRequest):
     result = generate_response(prompt, max_new_tokens=600)
 
     return {"comparison": result}
+
+
+# ===============================
+# CLEANUP SESSION
+# ===============================
+@app.post("/cleanup-session")
+def cleanup_session(data: CleanupRequest):
+    """Remove all data associated with a session to free memory."""
+    if data.session_id in SESSION_STORES:
+        del SESSION_STORES[data.session_id]
+        return {"message": f"Session {data.session_id} cleaned up."}
+    return {"message": "Session not found."}
 
 
 if __name__ == "__main__":
