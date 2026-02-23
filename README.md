@@ -68,14 +68,16 @@ uvicorn main:app --host 0.0.0.0 --port 5000 --reload
 ### Terminal B — Node backend (port 4000)
 
 ```bash
-cd /workspaces/pdf-qa-bot
+# from the repository root (where server.js lives)
+cd <your-repo-directory>
 node server.js
 ```
 
 ### Terminal C — Frontend (port 3000)
 
 ```bash
-cd /workspaces/pdf-qa-bot/frontend
+# navigate into the frontend subfolder from the repo root
+cd frontend
 npm start
 ```
 
@@ -119,4 +121,4 @@ Interactive docs: `http://localhost:5000/docs`
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+Refer to [CONTRIBUTING.md](CONTRIBUTING.md) for detailed instructions on creating a branch, naming conventions, committing changes, and submitting pull requests.
