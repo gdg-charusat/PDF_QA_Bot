@@ -5,8 +5,6 @@ import { Document, Page, pdfjs } from "react-pdf";
 import "bootstrap/dist/css/bootstrap.min.css";
 import {
   Container,
-  Row,
-  Col,
   Button,
   Form,
   Card,
@@ -16,15 +14,16 @@ import {
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL(
   "pdfjs-dist/build/pdf.worker.min.mjs",
-  import.meta.url,
+  import.meta.url
 ).toString();
 
 const API_BASE = process.env.REACT_APP_API_URL || "";
-
-// Theme persistence key
 const THEME_STORAGE_KEY = "pdf-qa-bot-theme";
 
 function App() {
+  // -------------------------------
+  // Core state
+  // -------------------------------
   const [file, setFile] = useState(null);
   const [pdfs, setPdfs] = useState([]); // {name, url, chat: []}
   const [selectedPdf, setSelectedPdf] = useState(null);
@@ -37,35 +36,61 @@ function App() {
   });
   const [numPages, setNumPages] = useState(null);
   const [pageNumber, setPageNumber] = useState(1);
+  const [pdfs, setPdfs] = useState([]); // { name, doc_id, url }
+  const [selectedDocs, setSelectedDocs] = useState([]);
+  const [question, setQuestion] = useState("");
+  const [chatHistory, setChatHistory] = useState([]);
+  const [comparisonResult, setComparisonResult] = useState(null);
+
+  // -------------------------------
+  // UI / status state
+  // -------------------------------
+  const [uploading, setUploading] = useState(false);
+  const [asking, setAsking] = useState(false);
   const [summarizing, setSummarizing] = useState(false);
   const [comparing, setComparing] = useState(false);
+
+  const [numPages, setNumPages] = useState(null);
+  const [pageNumber, setPageNumber] = useState(1);
+
+  // -------------------------------
+  // Theme persistence
+  // -------------------------------
+  const [darkMode, setDarkMode] = useState(() => {
+    const saved = localStorage.getItem(THEME_STORAGE_KEY);
+    return saved ? JSON.parse(saved) : false;
+  });
+
+  // -------------------------------
+  // Session isolation (security fix)
+  // -------------------------------
   const [sessionId, setSessionId] = useState("");
 
-  // Generate a session ID on mount (fix-data-leakage)
   useEffect(() => {
     setSessionId(
       crypto.randomUUID
         ? crypto.randomUUID()
-        : Math.random().toString(36).substring(2, 15),
+        : Math.random().toString(36).substring(2, 15)
     );
   }, []);
 
-  // Save theme preference when it changes
   useEffect(() => {
     localStorage.setItem(THEME_STORAGE_KEY, JSON.stringify(darkMode));
     document.body.classList.toggle("dark-mode", darkMode);
   }, [darkMode]);
 
-  // ===============================
-  // Upload
-  // ===============================
+  // -------------------------------
+  // Upload PDF
+  // -------------------------------
   const uploadPDF = async () => {
     if (!file) return;
+
     setUploading(true);
-    setProcessingPdf(true);
+
     const formData = new FormData();
     formData.append("file", file);
     formData.append("sessionId", sessionId);
+
     try {
       const response = await axios.post(`${API_BASE}/upload`, formData);
       const url = URL.createObjectURL(file);
@@ -87,22 +112,50 @@ function App() {
     } finally {
       setUploading(false);
     }
+
+      setPdfs((prev) => [
+        ...prev,
+        { name: file.name, doc_id: res.data?.doc_id, url },
+      ]);
+
+      setFile(null);
+      alert("PDF uploaded!");
+    } catch {
+      alert("Upload failed.");
+    }
+
+    setUploading(false);
   };
 
-  // ===============================
-  // Ask
-  // ===============================
+  // -------------------------------
+  // Toggle document selection
+  // -------------------------------
+  const toggleDocSelection = (docId) => {
+    setComparisonResult(null);
+    setSelectedDocs((prev) =>
+      prev.includes(docId)
+        ? prev.filter((id) => id !== docId)
+        : [...prev, docId]
+    );
+  };
+
+  // -------------------------------
+  // Ask question
+  // -------------------------------
   const askQuestion = async () => {
     if (!question.trim() || selectedDocs.length === 0) return;
+
     setChatHistory((prev) => [...prev, { role: "user", text: question }]);
     setQuestion("");
     setAsking(true);
+
     try {
       const res = await axios.post(`${API_BASE}/ask`, {
         question,
         doc_ids: selectedDocs,
         sessionId,
       });
+
       setChatHistory((prev) => [
         ...prev,
         { role: "bot", text: res.data.answer },
@@ -113,20 +166,24 @@ function App() {
         { role: "bot", text: "Error getting answer." },
       ]);
     }
+
     setAsking(false);
   };
 
-  // ===============================
-  // Summarize
-  // ===============================
+  // -------------------------------
+  // Summarize PDFs
+  // -------------------------------
   const summarizePDF = async () => {
     if (selectedDocs.length === 0) return;
+
     setSummarizing(true);
+
     try {
       const res = await axios.post(`${API_BASE}/summarize`, {
         doc_ids: selectedDocs,
         sessionId,
       });
+
       setChatHistory((prev) => [
         ...prev,
         { role: "bot", text: res.data.summary },
@@ -134,88 +191,63 @@ function App() {
     } catch {
       alert("Error summarizing.");
     }
+
     setSummarizing(false);
   };
 
-  // ===============================
-  // Compare
-  // ===============================
+  // -------------------------------
+  // Compare PDFs
+  // -------------------------------
   const compareDocuments = async () => {
     if (selectedDocs.length < 2) return;
+
     setComparing(true);
+
     try {
       const res = await axios.post(`${API_BASE}/compare`, {
         doc_ids: selectedDocs,
         sessionId,
       });
-      if (selectedDocs.length === 2) {
-        setComparisonResult(res.data.comparison);
-      } else {
-        setChatHistory((prev) => [
-          ...prev,
-          { role: "user", text: "Compare selected documents." },
-          { role: "bot", text: res.data.comparison },
-        ]);
-      }
+
+      setComparisonResult(res.data.comparison);
+      setChatHistory((prev) => [
+        ...prev,
+        { role: "bot", text: res.data.comparison },
+      ]);
     } catch {
       alert("Error comparing documents.");
     }
+
     setComparing(false);
   };
 
-  const selectedPdfs = pdfs.filter((p) => selectedDocs.includes(p.doc_id));
-
-  // ===============================
-  // Theme classes
-  // ===============================
+  // -------------------------------
+  // UI helpers
+  // -------------------------------
   const pageBg = darkMode ? "bg-dark text-light" : "bg-light text-dark";
 
   const currentChat = pdfs.find(pdf => pdf.name === selectedPdf)?.chat || [];
   const currentPdfUrl = pdfs.find(pdf => pdf.name === selectedPdf)?.url || null;
+  const cardClass = darkMode
+    ? "text-white border-secondary shadow"
+    : "bg-white text-dark border-0 shadow-sm";
 
-  const inputClass = darkMode
-    ? "text-white border-secondary placeholder-white"
-    : "";
+  const inputClass = darkMode ? "text-white border-secondary" : "";
 
+  // -------------------------------
+  // Render
+  // -------------------------------
   return (
-    <div
-      className={pageBg}
-      style={{
-        minHeight: "100vh",
-        "--bs-card-bg": darkMode ? "#2c2c2c" : "#ffffff",
-        "--bs-body-bg": darkMode ? "#1e1e1e" : "#f8f9fa",
-      }}
-    >
-      {/* Navbar */}
-      <Navbar
-        bg={darkMode ? "dark" : "primary"}
-        variant="dark"
-        className="shadow mb-4 bg-gradient"
-      >
-        <Container className="d-flex justify-content-between align-items-center">
-          <Navbar.Brand className="fw-bold d-flex align-items-center gap-2">
-            <span role="img" aria-label="Bot">
-              🤖
-            </span>
-            PDF Q&A Bot
-          </Navbar.Brand>
-          <div className="d-flex align-items-center gap-2">
-            <span className="text-white small">
-              {darkMode ? "⭐ Dark" : "🔆 Light"}
-            </span>
-            <div className="form-check form-switch mb-0">
-              <input
-                className="form-check-input"
-                type="checkbox"
-                role="switch"
-                id="darkModeToggle"
-                checked={darkMode}
-                onChange={() => setDarkMode(!darkMode)}
-                aria-label="Toggle dark/light mode"
-                style={{ cursor: "pointer", width: "40px", height: "22px" }}
-              />
-            </div>
-          </div>
+    <div className={pageBg} style={{ minHeight: "100vh" }}>
+      <Navbar bg={darkMode ? "dark" : "primary"} variant="dark">
+        <Container className="d-flex justify-content-between">
+          <Navbar.Brand>🤖 PDF Q&A Bot</Navbar.Brand>
+          <Button
+            variant="outline-light"
+            onClick={() => setDarkMode(!darkMode)}
+          >
+            {darkMode ? "Light" : "Dark"}
+          </Button>
         </Container>
       </Navbar>
       <Container>
@@ -256,12 +288,29 @@ function App() {
                     </Dropdown.Menu>
                   </Dropdown>
                 )}
+
+      <Container className="mt-4">
+        {/* Upload */}
+        <Card className={`mb-4 ${cardClass}`}>
+          <Card.Body>
+            <Form>
+              <Form.Control
+                type="file"
+                className={inputClass}
+                onChange={(e) => setFile(e.target.files[0])}
+              />
+              <Button
+                className="mt-2"
+                onClick={uploadPDF}
+                disabled={!file || uploading}
+              >
+                {uploading ? <Spinner size="sm" /> : "Upload"}
               </Button>
             </Form>
           </Card.Body>
         </Card>
 
-        {/* Selection Card */}
+        {/* Document selection */}
         {pdfs.length > 0 && (
           <Card className={`mb-4 ${cardClass}`}>
             <Card.Body>
@@ -279,21 +328,15 @@ function App() {
           </Card>
         )}
 
-        {/* Side-by-side View */}
-        {selectedPdfs.length === 2 && (
-          <>
-            <Row className="mb-4">
-              {selectedPdfs.map((pdf) => (
-                <Col key={pdf.doc_id} md={6}>
-                  <Card className={cardClass}>
-                    <Card.Body>
-                      <h6>{pdf.name}</h6>
-                      <Document file={pdf.url}>
-                        <Page pageNumber={1} />
-                      </Document>
-                    </Card.Body>
-                  </Card>
-                </Col>
+        {/* Chat */}
+        <Card className={cardClass}>
+          <Card.Body>
+            <div style={{ maxHeight: 300, overflowY: "auto", marginBottom: 16 }}>
+              {chatHistory.map((msg, i) => (
+                <div key={i} className="mb-2">
+                  <strong>{msg.role === "user" ? "You" : "Bot"}:</strong>
+                  <ReactMarkdown>{msg.text}</ReactMarkdown>
+                </div>
               ))}
             </Row>
 
@@ -353,75 +396,48 @@ function App() {
             </Card>
           </>
         )}
+            </div>
 
-        {/* Chat Mode */}
-        {selectedPdfs.length !== 2 && (
-          <Card className={cardClass}>
-            <Card.Body>
-              <h5>Ask Across Selected Documents</h5>
-              <div
-                style={{ maxHeight: 300, overflowY: "auto", marginBottom: 16 }}
-              >
-                {chatHistory.map((msg, i) => (
-                  <div key={i} className="mb-2">
-                    <strong>{msg.role === "user" ? "You" : "Bot"}:</strong>
-                    <ReactMarkdown>{msg.text}</ReactMarkdown>
-                  </div>
-                ))}
-              </div>
+            <Form
+              className="d-flex gap-2"
+              onSubmit={(e) => {
+                e.preventDefault();
+                askQuestion();
+              }}
+            >
+              <Form.Control
+                type="text"
+                placeholder="Ask a question..."
+                value={question}
+                className={inputClass}
+                onChange={(e) => setQuestion(e.target.value)}
+                disabled={asking}
+              />
+              <Button disabled={asking || !question.trim()}>
+                {asking ? <Spinner size="sm" /> : "Ask"}
+              </Button>
+            </Form>
 
-              <Form
-                className="d-flex gap-2 mb-3"
-                onSubmit={(e) => e.preventDefault()}
-              >
-                <Form.Control
-                  type="text"
-                  placeholder="Ask a question..."
-                  className={inputClass}
-                  value={question}
-                  onChange={(e) => setQuestion(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      e.preventDefault();
-                      askQuestion();
-                    }
-                  }}
-                />
-                <Button
-                  variant="success"
-                  onClick={askQuestion}
-                  disabled={asking}
-                >
-                  {asking ? <Spinner size="sm" animation="border" /> : "Ask"}
-                </Button>
-              </Form>
-
+            <div className="mt-3">
               <Button
                 variant="warning"
                 className="me-2"
                 onClick={summarizePDF}
+                disabled={summarizing}
               >
-                {summarizing ? (
-                  <Spinner size="sm" animation="border" />
-                ) : (
-                  "Summarize"
-                )}
+                {summarizing ? <Spinner size="sm" /> : "Summarize"}
               </Button>
 
               <Button
                 variant="info"
                 onClick={compareDocuments}
-                disabled={selectedDocs.length < 2}
+                disabled={selectedDocs.length < 2 || comparing}
               >
-                {comparing ? (
-                  <Spinner size="sm" animation="border" />
-                ) : (
-                  "Compare Selected"
-                )}
+                {comparing ? <Spinner size="sm" /> : "Compare"}
               </Button>
-            </Card.Body>
-          </Card>
-        )}
+            </div>
+          </Card.Body>
+        </Card>
       </Container>
     </div>
   );
