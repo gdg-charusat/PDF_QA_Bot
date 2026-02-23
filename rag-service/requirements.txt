@@ -9,6 +9,7 @@ sentence-transformers
 transformers
 faiss-cpu
 pypdf
+python-docx
 requests
 numpy
 slowapi

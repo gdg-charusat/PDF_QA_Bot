@@ -1,18 +1,18 @@
 # PDF Q&A Bot
 
-RAG-based PDF question-answering app with:
+RAG-based document question-answering app with:
 
 - **Frontend**: React app (`frontend/`)
 - **Backend API**: Node + Express (`server.js`)
 - **RAG Service**: FastAPI + Hugging Face + FAISS (`rag-service/`)
 
-Upload a PDF, ask questions from its content, and generate a short summary.
+Upload documents (PDF, DOCX, TXT, Markdown), ask questions from their content, and generate summaries.
 
 ## Architecture
 
 1. Frontend uploads file to Node backend (`/upload`)
 2. Node forwards file path to FastAPI (`/process-pdf`)
-3. FastAPI loads/splits PDF, builds vector index with embeddings
+3. FastAPI detects file format (`.pdf`, `.docx`, `.txt`, `.md`), loads and splits the document, builds vector index with embeddings
 4. For `/ask` and `/summarize`, FastAPI retrieves relevant chunks and generates output with a Hugging Face model
 
 ## Project Structure
@@ -68,14 +68,16 @@ uvicorn main:app --host 0.0.0.0 --port 5000 --reload
 ### Terminal B — Node backend (port 4000)
 
 ```bash
-cd /workspaces/pdf-qa-bot
+# from the repository root (where server.js lives)
+cd <your-repo-directory>
 node server.js
 ```
 
 ### Terminal C — Frontend (port 3000)
 
 ```bash
-cd /workspaces/pdf-qa-bot/frontend
+# navigate into the frontend subfolder from the repo root
+cd frontend
 npm start
 ```
 
@@ -85,7 +87,7 @@ Open: `http://localhost:3000`
 
 Node backend (`http://localhost:4000`):
 
-- `POST /upload` (multipart form-data, field: `file`)
+- `POST /upload` (multipart form-data, field: `file`) — accepts `.pdf`, `.docx`, `.txt`, `.md`
 - `POST /ask` (`{ "question": "..." }`)
 - `POST /summarize` (`{}`)
 
@@ -119,4 +121,4 @@ Interactive docs: `http://localhost:5000/docs`
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+Refer to [CONTRIBUTING.md](CONTRIBUTING.md) for detailed instructions on creating a branch, naming conventions, committing changes, and submitting pull requests.

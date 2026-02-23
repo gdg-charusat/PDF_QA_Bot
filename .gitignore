@@ -22,5 +22,16 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 
+/node_modules
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+venv/
+
 .env
-uploads/
+
+# Uploaded PDFs
+uploads/*
+!uploads/.gitkeep
