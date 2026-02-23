@@ -281,6 +281,10 @@ class AskRequest(BaseModel):
 class SummarizeRequest(BaseModel):
     session_id: str
 
+
+class CompareRequest(BaseModel):
+    session_id: str
+
 # -------------------------------------------------------------------
 # SESSION CLEANUP
 # -------------------------------------------------------------------
@@ -456,29 +460,87 @@ def ask_question(request: Request, data: AskRequest):
 
 @app.post("/summarize")
 @limiter.limit("15/15 minutes")
-def summarize_pdf(request: Request, data: SummarizeRequest):
+async def summarize_pdf(request: Request, data: SummarizeRequest):
     cleanup_expired_sessions()
+    session_id = data.session_id
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
 
-    session = sessions.get(data.session_id)
-    if not session:
-        return {"summary": "Session expired or PDF not uploaded"}
+    sessions[session_id]["last_accessed"] = time.time()
+    vectorstore = sessions[session_id]["vectorstore"]
 
-    session["last_accessed"] = time.time()
-    vectorstore = session["vectorstore"]
-
-    docs = vectorstore.similarity_search("Summarize the document.", k=6)
-    if not docs:
-        return {"summary": "No content available"}
-
-    context = "\n\n".join(doc.page_content for doc in docs)
+    # Extract all text from the vectorstore for summarization
+    all_docs = list(vectorstore.docstore._dict.values())
+    full_text = "\n".join([doc.page_content for doc in all_docs])
 
     prompt = (
-        "Summarize the document in 6-8 concise bullet points.\n"
-        f"Context:\n{context}\nSummary:"
+        "You are a helpful assistant. Provide a concise summary of the following document content.\n\n"
+        f"Content:\n{full_text[:4000]}...\n\nSummary:"
     )
 
-    summary = generate_response(prompt, max_new_tokens=220)
-    return {"summary": normalize_answer(summary)}
+    summary = generate_response(prompt, max_new_tokens=256)
+    return {"summary": summary}
+
+
+@app.post("/compare")
+@limiter.limit("15/15 minutes")
+async def compare_documents(request: Request, data: CompareRequest):
+    """
+    Compare multiple documents within a session.
+    Groups chunks by their source metadata and generates a comparative summary.
+    """
+    cleanup_expired_sessions()
+    session_id = data.session_id
+    if session_id not in sessions:
+        raise HTTPException(status_code=404, detail="Session not found or expired")
+
+    sessions[session_id]["last_accessed"] = time.time()
+    vectorstore = sessions[session_id]["vectorstore"]
+
+    # Extract all documents from the FAISS internal docstore
+    try:
+        all_docs = list(vectorstore.docstore._dict.values())
+    except Exception:
+        all_docs = []
+
+    if not all_docs:
+        return {"comparison": "No documents found to compare."}
+
+    # Group chunks by their source file
+    docs_by_source = {}
+    for doc in all_docs:
+        source = doc.metadata.get("source", "Unknown")
+        if source not in docs_by_source:
+            docs_by_source[source] = []
+        docs_by_source[source].append(doc.page_content)
+
+    sources = list(docs_by_source.keys())
+    if len(sources) < 2:
+        return {"comparison": "Please upload at least two documents to generate a comparison."}
+
+    # Prepare summaries/metadata for comparison
+    comparison_context = ""
+    for i, source in enumerate(sources):
+        filename = Path(source).name
+        # Use first ~1500 chars of content as a representation for comparison
+        content_sample = "\n".join(docs_by_source[source])[:1500]
+        comparison_context += f"--- Document {i+1}: {filename} ---\n{content_sample}\n\n"
+
+    prompt = f"""
+    You are a professional analyst. Compare the following documents based on their content.
+
+    {comparison_context}
+
+    Instructions:
+    - Identify key similarities and differences.
+    - Format the response as a structured comparison (e.g., bullet points or sections).
+    - Be objective and concise.
+
+    Comparison:
+    """
+
+    comparison_result = generate_response(prompt, max_new_tokens=512)
+    return {"comparison": comparison_result}
 
 # -------------------------------------------------------------------
 # START SERVER
