@@ -8,6 +8,8 @@ from dotenv import load_dotenv
 import os
 import uvicorn
 import torch
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
 from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -17,15 +19,20 @@ from PyPDF2.errors import PdfReadError
 load_dotenv()
 
 app = FastAPI()
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
 
 # ===============================
 # GLOBAL STATE
 # ===============================
+vectorstore = None
+qa_chain = False
 VECTOR_STORE = None
 DOCUMENT_REGISTRY = {}
 DOCUMENT_EMBEDDINGS = {}
+CHAT_HISTORY = []  # Session-based chat history
 
-HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-small")
+HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-base")
 
 generation_tokenizer = None
 generation_model = None
@@ -111,11 +118,9 @@ class CompareRequest(BaseModel):
 # PROCESS PDF (MULTI-DOC SUPPORT)
 # ===============================
 @app.post("/process-pdf")
+@limiter.limit("15/15 minutes")
 def process_pdf(data: PDFPath):
-    global VECTOR_STORE, DOCUMENT_REGISTRY, DOCUMENT_EMBEDDINGS
-
-    if not os.path.exists(data.filePath):
-        return {"error": "File not found."}
+    global vectorstore, qa_chain, VECTOR_STORE, DOCUMENT_REGISTRY, DOCUMENT_EMBEDDINGS, CHAT_HISTORY
 
     # Validate file exists
     if not os.path.exists(data.filePath):
@@ -163,11 +168,37 @@ def process_pdf(data: PDFPath):
         if not chunks:
             raise HTTPException(status_code=400, detail="No text content found in PDF.")
         
-        vectorstore = FAISS.from_documents(chunks, embedding_model)
-        qa_chain = True
-        
         # Generate doc_id from filename
         doc_id = os.path.basename(data.filePath)
+        filename = os.path.basename(data.filePath)
+        
+        # Add doc_id to metadata
+        for chunk in chunks:
+            chunk.metadata["doc_id"] = doc_id
+        
+        # Update global vectorstore
+        if VECTOR_STORE is None:
+            VECTOR_STORE = FAISS.from_documents(chunks, embedding_model)
+        else:
+            VECTOR_STORE.add_documents(chunks)
+        
+        # Update legacy vectorstore for backward compatibility
+        vectorstore = VECTOR_STORE
+        qa_chain = True
+        
+        # Store document embeddings
+        embeddings = embedding_model.embed_documents([c.page_content for c in chunks])
+        doc_vector = np.mean(embeddings, axis=0)
+        DOCUMENT_EMBEDDINGS[doc_id] = doc_vector
+        
+        # Register document
+        DOCUMENT_REGISTRY[doc_id] = {
+            "filename": filename,
+            "num_chunks": len(chunks)
+        }
+        
+        # Reset chat history for new document
+        CHAT_HISTORY = []
 
         return {"message": "PDF processed successfully", "doc_id": doc_id}
     
@@ -175,27 +206,6 @@ def process_pdf(data: PDFPath):
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error processing PDF: {str(e)}")
-
-    if VECTOR_STORE is None:
-        VECTOR_STORE = FAISS.from_documents(chunks, embedding_model)
-    else:
-        VECTOR_STORE.add_documents(chunks)
-
-    embeddings = embedding_model.embed_documents(
-        [c.page_content for c in chunks]
-    )
-    doc_vector = np.mean(embeddings, axis=0)
-    DOCUMENT_EMBEDDINGS[doc_id] = doc_vector
-
-    DOCUMENT_REGISTRY[doc_id] = {
-        "filename": filename,
-        "num_chunks": len(chunks)
-    }
-
-    return {
-        "message": "PDF processed successfully",
-        "doc_id": doc_id
-    }
 
 
 # ===============================
@@ -228,17 +238,23 @@ def similarity_matrix():
 
 
 # ===============================
-# ASK QUESTION (FIXED MULTI-DOC FILTER)
+# ASK QUESTION (WITH CHAT HISTORY)
 # ===============================
 @app.post("/ask")
+@limiter.limit("60/15 minutes")
 def ask_question(data: Question):
-    global VECTOR_STORE
+    global vectorstore, qa_chain, VECTOR_STORE, CHAT_HISTORY
 
-    if VECTOR_STORE is None:
+    # Use VECTOR_STORE if available, fallback to vectorstore
+    active_store = VECTOR_STORE or vectorstore
+    
+    if not qa_chain and active_store is None:
         return {"answer": "Please upload at least one PDF first!"}
 
-    docs = VECTOR_STORE.similarity_search(data.question, k=10)
+    # Retrieve relevant documents
+    docs = active_store.similarity_search(data.question, k=10)
 
+    # Filter by doc_ids if provided
     if data.doc_ids:
         docs = [d for d in docs if d.metadata.get("doc_id") in data.doc_ids]
 
@@ -246,7 +262,15 @@ def ask_question(data: Question):
         return {"answer": "No relevant context found."}
 
     context = "\n\n".join([d.page_content for d in docs])
+    
+    # Build chat history context
+    history_context = ""
+    if CHAT_HISTORY:
+        history_context = "\n\nPrevious conversation:\n"
+        for entry in CHAT_HISTORY[-3:]:  # Last 3 exchanges
+            history_context += f"Q: {entry['question']}\nA: {entry['answer']}\n"
 
+    # Build prompt with history
     if data.doc_ids and len(data.doc_ids) > 1:
         prompt = (
             "You are an AI assistant comparing multiple documents.\n"
@@ -254,6 +278,7 @@ def ask_question(data: Question):
             "- Similarities\n"
             "- Differences\n"
             "- Unique points per document\n\n"
+            f"{history_context}\n"
             f"Context:\n{context}\n\n"
             f"Question: {data.question}\n"
             "Answer:"
@@ -262,12 +287,20 @@ def ask_question(data: Question):
         prompt = (
             "You are a helpful assistant answering questions about a PDF.\n"
             "Use ONLY the provided context.\n\n"
+            f"{history_context}\n"
             f"Context:\n{context}\n\n"
             f"Question: {data.question}\n"
             "Answer:"
         )
 
     answer = generate_response(prompt, max_new_tokens=300)
+    
+    # Store in chat history
+    CHAT_HISTORY.append({
+        "question": data.question,
+        "answer": answer
+    })
+    
     return {"answer": answer}
 
 
@@ -275,13 +308,17 @@ def ask_question(data: Question):
 # SUMMARIZE
 # ===============================
 @app.post("/summarize")
+@limiter.limit("15/15 minutes")
 def summarize_pdf(data: SummarizeRequest):
-    global VECTOR_STORE
+    global vectorstore, qa_chain, VECTOR_STORE
 
-    if VECTOR_STORE is None:
+    # Use VECTOR_STORE if available, fallback to vectorstore
+    active_store = VECTOR_STORE or vectorstore
+    
+    if not qa_chain and active_store is None:
         return {"summary": "Please upload at least one PDF first!"}
 
-    docs = VECTOR_STORE.similarity_search("Summarize the document.", k=12)
+    docs = active_store.similarity_search("Summarize the document.", k=12)
 
     if data.doc_ids:
         docs = [d for d in docs if d.metadata.get("doc_id") in data.doc_ids]
@@ -351,4 +388,4 @@ def compare_documents(data: CompareRequest):
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=5000)
+    uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=True)

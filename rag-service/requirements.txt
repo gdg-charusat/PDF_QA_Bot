@@ -12,4 +12,5 @@ pypdf
 PyPDF2
 requests
 numpy
+scikit-learn
 slowapi
