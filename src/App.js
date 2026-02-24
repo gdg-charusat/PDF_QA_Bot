@@ -40,6 +40,15 @@ function App() {
     setAsking(false);
   };
 
+  const clearHistory = async () => {
+    try {
+      await axios.post("http://localhost:4000/clear-history");
+      setChat([]);
+    } catch (e) {
+      alert("Failed to clear history.");
+    }
+  };
+
   return (
     <Container maxWidth="sm">
       <AppBar position="static" color="primary" sx={{ mb: 2 }}>
@@ -68,7 +77,17 @@ function App() {
       </Paper>
 
       <Paper elevation={3} sx={{ p: 3, mb: 2, minHeight: 300 }}>
-        <Typography variant="subtitle1" gutterBottom>Chat</Typography>
+        <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+          <Typography variant="subtitle1">Chat</Typography>
+          <Button
+            variant="outlined"
+            size="small"
+            onClick={clearHistory}
+            disabled={chat.length === 0}
+          >
+            Clear History
+          </Button>
+        </Box>
         <Box sx={{ maxHeight: 250, overflowY: "auto", mb: 2 }}>
           {chat.map((msg, i) => (
             <Box key={i} display="flex" justifyContent={msg.role === "user" ? "flex-end" : "flex-start"} mb={1}>

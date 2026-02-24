@@ -62,3 +62,10 @@ body.dark-mode ::-webkit-scrollbar-thumb {
 body.dark-mode ::-webkit-scrollbar-thumb:hover {
   background: #777;
 }
+
+input.placeholder-white::placeholder,
+textarea.placeholder-white::placeholder {
+  color: #adb5bd !important;
+  opacity: 1 !important;
+  -webkit-text-fill-color: #adb5bd !important;
+}

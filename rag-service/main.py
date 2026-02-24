@@ -1,315 +1,353 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, Field, validator
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_core.documents import Document
+from langchain_core.prompts import PromptTemplate
+from groq import Groq
 from dotenv import load_dotenv
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 import os
+import re
 import uvicorn
-import torch
-from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM
-from uuid import uuid4
-import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
+import time
 
+# -------------------------------------------------------------------
+# APP SETUP
+# -------------------------------------------------------------------
 load_dotenv()
 
+BASE_DIR = Path(__file__).resolve().parent.parent
+UPLOAD_DIR = (BASE_DIR / "uploads").resolve()
+
 app = FastAPI()
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
 
-# ===============================
-# GLOBAL STATE
-# ===============================
-VECTOR_STORE = None
-DOCUMENT_REGISTRY = {}
-DOCUMENT_EMBEDDINGS = {}
+# ---------------------------------------------------------------------------
+# GROQ CLIENT SETUP
+# ---------------------------------------------------------------------------
 
-HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-small")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
-generation_tokenizer = None
-generation_model = None
-generation_is_encoder_decoder = False
+if not GROQ_API_KEY:
+    raise RuntimeError(
+        "GROQ_API_KEY is not set. Please add it to your .env file.\n"
+        "Get a free key at https://console.groq.com"
+    )
 
-# ===============================
-# EMBEDDING MODEL
-# ===============================
+groq_client = Groq(api_key=GROQ_API_KEY)
+
+# Session management
+sessions = {}
+SESSION_TIMEOUT = 3600  # 1 hour
+
 embedding_model = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
 
-# ===============================
-# MODEL LOADING
-# ===============================
-def load_generation_model():
-    global generation_tokenizer, generation_model, generation_is_encoder_decoder
-
-    if generation_model is not None:
-        return generation_tokenizer, generation_model, generation_is_encoder_decoder
-
-    config = AutoConfig.from_pretrained(HF_GENERATION_MODEL)
-    generation_is_encoder_decoder = bool(getattr(config, "is_encoder_decoder", False))
-    generation_tokenizer = AutoTokenizer.from_pretrained(HF_GENERATION_MODEL)
-
-    if generation_is_encoder_decoder:
-        generation_model = AutoModelForSeq2SeqLM.from_pretrained(HF_GENERATION_MODEL)
-    else:
-        generation_model = AutoModelForCausalLM.from_pretrained(HF_GENERATION_MODEL)
-
-    if torch.cuda.is_available():
-        generation_model = generation_model.to("cuda")
-
-    generation_model.eval()
-    return generation_tokenizer, generation_model, generation_is_encoder_decoder
+# -------------------------------------------------------------------
+# TEXT NORMALIZATION
+# -------------------------------------------------------------------
+def normalize_spaced_text(text: str) -> str:
+    """
+    Fixes character-level spaced text produced by PyPDFLoader on certain
+    vector-based PDFs (e.g. NPTEL / IBM Coursera certificates).
+    """
+    def fix_spaced_word(match):
+        return match.group(0).replace(" ", "")
+    pattern = r"\b(?:[A-Za-z] ){2,}[A-Za-z]\b"
+    return re.sub(pattern, fix, text)
 
 
-def generate_response(prompt: str, max_new_tokens: int) -> str:
-    tokenizer, model, is_encoder_decoder = load_generation_model()
-    device = next(model.parameters()).device
-
-    encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
-    encoded = {k: v.to(device) for k, v in encoded.items()}
-    pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
-
-    with torch.no_grad():
-        output_ids = model.generate(
-            **encoded,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=pad_token_id,
-        )
-
-    if is_encoder_decoder:
-        return tokenizer.decode(output_ids[0], skip_special_tokens=True).strip()
-
-    input_len = encoded["input_ids"].shape[1]
-    new_tokens = output_ids[0][input_len:]
-    return tokenizer.decode(new_tokens, skip_special_tokens=True).strip()
+def normalize_answer(text: str) -> str:
+    """
+    Post-processes the LLM-generated answer.
+    """
+    text = normalize_spaced_text(text)
+    # Strip only clear prompt-echo artefacts at the very start
+    text = re.sub(r'^(Final Answer:|Context:|Question:)\s*', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'[ \t]{2,}', ' ', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
 
 
-# ===============================
+# ---------------------------------------------------------------------------
+# CCC PROMPT TEMPLATE (Connect – Content – Continue)
+# ---------------------------------------------------------------------------
+
+_CCC_SYSTEM = (
+    "You are an intelligent PDF Question Answering Assistant.\n"
+    "Your task is to answer the user's question strictly using the provided context "
+    "retrieved from uploaded documents.\n\n"
+    "Follow the CCC communication structure in a SINGLE response:\n\n"
+    "1. Context Connection — Start with a short professional greeting (e.g. \"Hello,\").\n"
+    "2. Content Explanation — Rewrite the retrieved context in clear, meaningful, "
+    "grammatically correct sentences. Do NOT copy text directly.\n"
+    "3. Core Answer — Present the main explanation in a structured, readable format.\n"
+    "4. Call to Action — End with a relevant follow-up question to encourage further exploration.\n\n"
+    "Rules:\n"
+    "- Use ONLY the provided context. Do NOT add external knowledge.\n"
+    "- If the answer is not in the context, say: "
+    "\"The uploaded document does not contain sufficient information to answer this question.\"\n"
+    "- Maintain a clear, professional tone.\n"
+    "- Produce one continuous response — no bullet headers like '1.' or '2.'."
+)
+
+_CCC_USER_TEMPLATE = """\
+Context from the uploaded PDF:
+{context}
+
+Question:
+{question}
+
+Final Answer:"""
+
+CCC_PROMPT = PromptTemplate(
+    input_variables=["context", "question"],
+    template=_CCC_USER_TEMPLATE,
+)
+
+
+# ---------------------------------------------------------------------------
+# GROQ GENERATION
+# ---------------------------------------------------------------------------
+
+def generate_response(system_prompt: str, user_prompt: str, max_tokens: int = 600) -> str:
+    """
+    Calls the Groq chat-completions API with a system + user message pair.
+    """
+    completion = groq_client.chat.completions.create(
+        model=GROQ_MODEL,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user",   "content": user_prompt},
+        ],
+        max_tokens=max_tokens,
+        temperature=0.3,
+    )
+    return completion.choices[0].message.content.strip()
+
+
+# -------------------------------------------------------------------
 # REQUEST MODELS
-# ===============================
-class PDFPath(BaseModel):
+# -------------------------------------------------------------------
+
+class DocumentPath(BaseModel):
     filePath: str
+    session_id: str
 
 
-class Question(BaseModel):
-    question: str
-    doc_ids: list[str] | None = None
-
+class AskRequest(BaseModel):
+    question: str = Field(..., min_length=1, max_length=2000)
+    session_id: str
+    history: list = []
 
 class SummarizeRequest(BaseModel):
-    doc_ids: list[str] | None = None
+    session_id: str
+    pdf: str | None = None
 
 
-class CompareRequest(BaseModel):
-    doc_ids: list[str]
+# -------------------------------------------------------------------
+# SESSION CLEANUP
+# -------------------------------------------------------------------
+def cleanup_expired_sessions():
+    now = time.time()
+    expired = [
+        sid for sid, s in sessions.items()
+        if now - s["last_accessed"] > SESSION_TIMEOUT
+    ]
+    for sid in expired:
+        del sessions[sid]
 
+# -------------------------------------------------------------------
+# ENDPOINTS
+# ---------------------------------------------------------------------------
 
-# ===============================
-# PROCESS PDF (MULTI-DOC SUPPORT)
-# ===============================
 @app.post("/process-pdf")
-def process_pdf(data: PDFPath):
-    global VECTOR_STORE, DOCUMENT_REGISTRY, DOCUMENT_EMBEDDINGS
+@limiter.limit("15/15 minutes")
+def process_pdf(request: Request, data: DocumentPath):
+    cleanup_expired_sessions()
 
-    if not os.path.exists(data.filePath):
-        return {"error": "File not found."}
+    # Resolve and validate path (prevent path traversal)
+    file_path = Path(data.filePath).resolve()
 
-    loader = PyPDFLoader(data.filePath)
-    docs = loader.load()
+    if not str(file_path).startswith(str(UPLOAD_DIR)):
+        raise HTTPException(status_code=400, detail="Invalid file path")
 
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=100
-    )
-    chunks = splitter.split_documents(docs)
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    ext = file_path.suffix.lower()
+    if ext not in SUPPORTED_EXTENSIONS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file format: {ext}. Supported: {', '.join(SUPPORTED_EXTENSIONS)}"
+        )
+
+    try:
+        raw_docs = load_document(str(file_path))
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to load document: {str(e)}")
+
+    cleaned_docs = []
+    for doc in raw_docs:
+        cleaned_content = normalize_spaced_text(doc.page_content)
+        cleaned_docs.append(Document(page_content=cleaned_content, metadata=doc.metadata))
+
+    chunks = splitter.split_documents(cleaned_docs)
 
     if not chunks:
-        return {"error": "No text chunks generated from the PDF."}
+        raise HTTPException(
+            status_code=400,
+            detail="No text extracted from the document."
+        )
 
-    doc_id = str(uuid4())
-    filename = os.path.basename(data.filePath)
-
-    for chunk in chunks:
-        chunk.metadata = {
-            "doc_id": doc_id,
-            "filename": filename
-        }
-
-    if VECTOR_STORE is None:
-        VECTOR_STORE = FAISS.from_documents(chunks, embedding_model)
-    else:
-        VECTOR_STORE.add_documents(chunks)
-
-    embeddings = embedding_model.embed_documents(
-        [c.page_content for c in chunks]
-    )
-    doc_vector = np.mean(embeddings, axis=0)
-    DOCUMENT_EMBEDDINGS[doc_id] = doc_vector
-
-    DOCUMENT_REGISTRY[doc_id] = {
-        "filename": filename,
-        "num_chunks": len(chunks)
+    sessions[data.session_id] = {
+        "vectorstore": FAISS.from_documents(chunks, embedding_model),
+        "last_accessed": time.time(),
     }
 
-    return {
-        "message": "PDF processed successfully",
-        "doc_id": doc_id
-    }
-
+    return {"message": "Document processed successfully"}
 
 # ===============================
-# LIST DOCUMENTS
+# RELEVANCE CONFIGURATION
 # ===============================
-@app.get("/documents")
-def list_documents():
-    return DOCUMENT_REGISTRY
+# Uses cosine similarity (0 to 1) instead of raw L2 distance.
+# 0.0 = completely unrelated, 1.0 = identical match.
+# NOTE: The conversion from FAISS scores to cosine similarity assumes that
+# embeddings are L2-normalized and that FAISS uses IndexFlatL2 (L2 squared).
+RELEVANCE_THRESHOLD = 0.25  # Minimum cosine similarity for relevance
 
 
-# ===============================
-# SIMILARITY MATRIX
-# ===============================
-@app.get("/similarity-matrix")
-def similarity_matrix():
-    if len(DOCUMENT_EMBEDDINGS) < 2:
-        return {"error": "At least 2 documents required."}
+def faiss_score_to_cosine_sim(score: float) -> float:
+    """Convert a FAISS L2 squared distance score to cosine similarity.
 
-    doc_ids = list(DOCUMENT_EMBEDDINGS.keys())
-    vectors = np.array([DOCUMENT_EMBEDDINGS[d] for d in doc_ids])
-    sim_matrix = cosine_similarity(vectors)
+    Assumptions:
+    - Embedding vectors are L2-normalized (||v|| = 1). True for many
+      sentence-transformer models including all-MiniLM-L6-v2.
+    - The FAISS index returns L2 squared distances (e.g., IndexFlatL2).
 
-    result = {}
-    for i, doc_id in enumerate(doc_ids):
-        result[doc_id] = {}
-        for j, other_id in enumerate(doc_ids):
-            result[doc_id][other_id] = float(sim_matrix[i][j])
+    Under these conditions:
+        ||u - v||^2 = 2 - 2 * cos(theta)
+        => cos(theta) = 1 - (||u - v||^2 / 2)
 
-    return result
+    The returned value is clamped to [0.0, 1.0] for numerical stability.
+    """
+    return max(0.0, 1.0 - score / 2.0)
 
 
-# ===============================
-# ASK QUESTION (FIXED MULTI-DOC FILTER)
-# ===============================
+def compute_confidence(faiss_scores: list[float]) -> float:
+    """Compute confidence (0-100%) from FAISS scores using the top-3 chunks.
+
+    The provided FAISS scores are assumed to be L2 squared distances for
+    L2-normalized embeddings (see ``faiss_score_to_cosine_sim``). Scores are
+    converted to cosine similarities and the top-3 most relevant chunks are
+    averaged to produce a confidence value in percent.
+    """
+    if not faiss_scores:
+        return 0.0
+    top_scores = sorted(faiss_scores)[:3]
+    similarities = [faiss_score_to_cosine_sim(s) for s in top_scores]
+    avg_sim = sum(similarities) / len(similarities)
+    return round(float(avg_sim * 100), 1)
+
+
 @app.post("/ask")
-def ask_question(data: Question):
-    global VECTOR_STORE
+@limiter.limit("60/15 minutes")
+def ask_question(request: Request, data: AskRequest):
+    cleanup_expired_sessions()
 
-    if VECTOR_STORE is None:
-        return {"answer": "Please upload at least one PDF first!"}
+    session_data = sessions.get(data.session_id)
+    if not session_data:
+        return {"answer": "Session expired or no PDF uploaded for this session!", "confidence_score": 0}
 
-    docs = VECTOR_STORE.similarity_search(data.question, k=10)
+    session_data["last_accessed"] = time.time()
+    vectorstore = session_data["vectorstore"]
 
-    if data.doc_ids:
-        docs = [d for d in docs if d.metadata.get("doc_id") in data.doc_ids]
+    question = data.question
+    history = data.history
 
+    conversation_context = ""
+    for msg in history[-5:]:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        conversation_context += f"{role}: {content}\n"
+
+    docs = vectorstore.similarity_search(question, k=4)
     if not docs:
-        return {"answer": "No relevant context found."}
+        return {"answer": "No relevant context found in the uploaded document."}
 
-    context = "\n\n".join([d.page_content for d in docs])
+    context = "\n\n".join([doc.page_content for doc in docs])
 
-    if data.doc_ids and len(data.doc_ids) > 1:
-        prompt = (
-            "You are an AI assistant comparing multiple documents.\n"
-            "Clearly structure your answer as:\n"
-            "- Similarities\n"
-            "- Differences\n"
-            "- Unique points per document\n\n"
-            f"Context:\n{context}\n\n"
-            f"Question: {data.question}\n"
-            "Answer:"
-        )
-    else:
-        prompt = (
-            "You are a helpful assistant answering questions about a PDF.\n"
-            "Use ONLY the provided context.\n\n"
-            f"Context:\n{context}\n\n"
-            f"Question: {data.question}\n"
-            "Answer:"
+    question_with_history = question
+    if conversation_context.strip():
+        question_with_history = (
+            f"Conversation so far:\n{conversation_context.strip()}\n\n"
+            f"Current Question: {question}"
         )
 
-    answer = generate_response(prompt, max_new_tokens=300)
-    return {"answer": answer}
-
-
-# ===============================
-# SUMMARIZE
-# ===============================
-@app.post("/summarize")
-def summarize_pdf(data: SummarizeRequest):
-    global VECTOR_STORE
-
-    if VECTOR_STORE is None:
-        return {"summary": "Please upload at least one PDF first!"}
-
-    docs = VECTOR_STORE.similarity_search("Summarize the document.", k=12)
-
-    if data.doc_ids:
-        docs = [d for d in docs if d.metadata.get("doc_id") in data.doc_ids]
-
-    if not docs:
-        return {"summary": "No document context available."}
-
-    context = "\n\n".join([d.page_content for d in docs])
-
-    prompt = (
-        "Summarize the content in 6-8 concise bullet points.\n\n"
-        f"Context:\n{context}\n\n"
-        "Summary:"
+    user_prompt = CCC_PROMPT.format(
+        context=context,
+        question=question_with_history,
     )
 
-    summary = generate_response(prompt, max_new_tokens=250)
+    raw_answer = generate_response(
+        system_prompt=_CCC_SYSTEM,
+        user_prompt=user_prompt,
+        max_tokens=600,
+    )
+
+    answer = normalize_answer(raw_answer)
+    return {"answer": answer, "confidence_score": confidence}
+
+
+@app.post("/summarize")
+@limiter.limit("15/15 minutes")
+def summarize_pdf(request: Request, data: SummarizeRequest):
+    cleanup_expired_sessions()
+
+    session = sessions.get(data.session_id)
+    if not session:
+        return {"summary": "Session expired or PDF not uploaded"}
+
+    session["last_accessed"] = time.time()
+    vectorstore = session["vectorstore"]
+
+
+    docs = vectorstore.similarity_search("Summarize the document.", k=6)
+    if not docs:
+        return {"summary": "No content available"}
+
+    context = "\n\n".join([doc.page_content for doc in docs])
+
+    system_prompt = (
+        "You are a document summarization assistant.\n"
+        "Rules:\n"
+        "1. Summarize in 6-8 concise bullet points.\n"
+        "2. Clearly state: who received the certificate/document, what it is for, "
+        "which organization issued it, who authorized it, and the date.\n"
+        "3. Use proper Title Case for names. Return clean, readable text.\n"
+        "4. Use ONLY the information in the provided context."
+    )
+
+    user_prompt = f"Context:\n{context}\n\nSummary (bullet points):"
+
+    raw_summary = generate_response(
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        max_tokens=512
+    )
+    summary = normalize_answer(raw_summary)
     return {"summary": summary}
 
 
-# ===============================
-# NEW: COMPARE SELECTED DOCUMENTS
-# ===============================
-@app.post("/compare")
-def compare_documents(data: CompareRequest):
-    global VECTOR_STORE, DOCUMENT_REGISTRY
-
-    if VECTOR_STORE is None:
-        return {"comparison": "Upload documents first."}
-
-    if len(data.doc_ids) < 2:
-        return {"comparison": "Select at least 2 documents."}
-
-    # Pull more candidates
-    docs = VECTOR_STORE.similarity_search("Main topics and differences.", k=15)
-
-    # Filter safely
-    docs = [d for d in docs if d.metadata.get("doc_id") in data.doc_ids]
-
-    if not docs:
-        return {"comparison": "No comparable content found."}
-
-    # Limit per document to avoid overload
-    grouped = {}
-    for d in docs:
-        grouped.setdefault(d.metadata["doc_id"], []).append(d.page_content)
-
-    context = ""
-    for doc_id in data.doc_ids:
-        filename = DOCUMENT_REGISTRY.get(doc_id, {}).get("filename", doc_id)
-        content = "\n\n".join(grouped.get(doc_id, [])[:4])
-        context += f"\n\nDocument: {filename}\n{content}\n"
-
-    prompt = (
-        "You are an expert AI that compares documents.\n"
-        "Provide a detailed comparison with:\n"
-        "1. Overall Themes\n"
-        "2. Key Similarities\n"
-        "3. Key Differences\n"
-        "4. Unique Strengths per Document\n\n"
-        f"{context}\n\n"
-        "Comparison:"
-    )
-
-    result = generate_response(prompt, max_new_tokens=600)
-
-    return {"comparison": result}
-
-
+# -------------------------------------------------------------------
+# START SERVER
+# -------------------------------------------------------------------
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=5000)
+    uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=True)

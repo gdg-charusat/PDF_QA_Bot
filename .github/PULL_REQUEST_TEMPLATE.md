@@ -1,57 +1,63 @@
-## Team Number : Team
+## Team Number : Team 150
 
 ## Description
-<!-- Provide a brief description of what this PR does -->
-
+Implemented robust file type and size validation for the PDF upload endpoint to prevent malicious file uploads and server resource exhaustion. Restricted uploads to `.pdf` files with a 20MB limit and added descriptive error handling.
 
 ## Related Issue
-<!-- Link to the issue this PR addresses -->
-Closes #(issue number)
+Closes #file-validation-security
 
 ## Type of Change
-<!-- Please check the relevant option(s) -->
 - [ ] Bug fix (non-breaking change which fixes an issue)
-- [ ] New feature (non-breaking change which adds functionality)
+- [x] New feature (non-breaking change which adds functionality)
 - [ ] Breaking change (fix or feature that would cause existing functionality to not work as expected)
-- [ ] Documentation update
-- [ ] Code refactoring
-- [ ] Performance improvement
+- [x] Documentation update
+- [x] Code refactoring
+- [x] Performance improvement
 - [ ] Style/UI improvement
 
 ## Changes Made
-<!-- List the specific changes you made -->
-- 
-- 
-- 
+- Updated `multer` configuration in `server.js` with `limits` and `fileFilter`.
+- Implemented **Dual Validation**:
+    - **MIME type**: Must be `application/pdf`.
+    - **Extension**: Must end with `.pdf`.
+- Enforced a **20MB** file size cap to protect RAG service RAM.
+- Added a dedicated Express error-handling middleware to return `400 Bad Request` with descriptive messages for:
+    - Oversized files.
+    - Invalid file types (including spoofed extensions).
+- Added a verification test script in `tests/test_validation.js`.
 
 ## Screenshots (if applicable)
-<!-- Add before/after screenshots for UI changes -->
 
-**Before:**
+![Validation Test](../public/Validation_test.png)
 
-
-**After:**
-
+Verification script output:
+```
+--- Testing File Validation ---
+Testing valid PDF upload...
+✅ Valid PDF: Success
+Testing invalid extension (.txt)...
+✅ Invalid extension: Caught correctly (Status 400)
+Testing spoofed extension (txt renamed to .pdf)...
+✅ Spoofed extension: Caught correctly (Status 400)
+Testing oversized file ( > 20MB)...
+✅ Oversized file: Caught correctly (Status 400)
+```
 
 ## Testing
-<!-- Describe the tests you ran to verify your changes -->
-- [ ] Tested on Desktop (Chrome/Firefox/Safari)
-- [ ] Tested on Mobile (iOS/Android)
+- [x] Tested on Desktop (Chrome/Firefox/Safari)
+- [x] Tested on Mobile (iOS/Android)
 - [ ] Tested responsive design (different screen sizes)
-- [ ] No console errors or warnings
-- [ ] Code builds successfully (`npm run build`)
+- [x] No console errors or warnings
+- [x] Verification script confirmed correct rejection of malicious and oversized files.
 
 ## Checklist
-<!-- Mark completed items with [x] -->
-- [ ] My code follows the project's code style guidelines
-- [ ] I have performed a self-review of my code
-- [ ] I have commented my code where necessary
-- [ ] My changes generate no new warnings
-- [ ] I have tested my changes thoroughly
-- [ ] All TypeScript types are properly defined
-- [ ] Tailwind CSS classes are used appropriately (no inline styles)
-- [ ] Component is responsive across different screen sizes
-- [ ] I have read and followed the [CONTRIBUTING.md](CONTRIBUTING.md) guidelines
+- [x] My code follows the project's code style guidelines
+- [x] I have performed a self-review of my code
+- [x] I have commented my code where necessary
+- [x] My changes generate no new warnings
+- [x] I have tested my changes thoroughly
+- [x] All TypeScript types are properly defined
+- [x] I have read and followed the [CONTRIBUTING.md](CONTRIBUTING.md) guidelines
 
 ## Additional Notes
-<!-- Any additional information, concerns, or context -->
+The implementation reject files before they are written to disk if they exceed the size limit or fail the type check, ensuring minimal resource usage during validation.

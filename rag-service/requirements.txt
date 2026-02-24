@@ -4,11 +4,14 @@ python-dotenv
 pydantic
 langchain
 langchain-community
+langchain-core
 langchain-text-splitters
+langchain-core
 sentence-transformers
-transformers
 faiss-cpu
 pypdf
+python-docx
 requests
 numpy
 slowapi
+groq
