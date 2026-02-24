@@ -20,9 +20,13 @@ pdfjs.GlobalWorkerOptions.workerSrc = new URL(
   import.meta.url
 ).toString();
 
-const API_BASE = process.env.REACT_APP_API_URL || "";
+const API_BASE = process.env.REACT_APP_API_URL || "http://localhost:4000";
 
 function App() {
+  const [token, setToken] = useState(localStorage.getItem("token") || "");
+  const [authForm, setAuthForm] = useState({ email: "", password: "", isLogin: true });
+  const [authError, setAuthError] = useState("");
+
   const [file, setFile] = useState(null);
   const [pdfs, setPdfs] = useState([]);
   const [selectedDocs, setSelectedDocs] = useState([]);
@@ -35,6 +39,59 @@ function App() {
   const [comparing, setComparing] = useState(false);
   const [darkMode, setDarkMode] = useState(false);
 
+  // Axios instance with interceptor for auth
+  const api = axios.create({
+    baseURL: API_BASE,
+  });
+
+  api.interceptors.request.use((config) => {
+    if (token) {
+      config.headers.Authorization = `Bearer ${token}`;
+    }
+    return config;
+  });
+
+  api.interceptors.response.use(
+    (response) => response,
+    (error) => {
+      if (error.response && error.response.status === 401) {
+        handleLogout();
+      }
+      return Promise.reject(error);
+    }
+  );
+
+  const handleAuth = async (e) => {
+    e.preventDefault();
+    setAuthError("");
+    const endpoint = authForm.isLogin ? "/auth/login" : "/auth/register";
+    try {
+      const res = await axios.post(`${API_BASE}${endpoint}`, {
+        email: authForm.email,
+        password: authForm.password
+      });
+
+      if (authForm.isLogin) {
+        const newToken = res.data.token;
+        setToken(newToken);
+        localStorage.setItem("token", newToken);
+      } else {
+        alert("Registered successfully! Please login.");
+        setAuthForm({ ...authForm, isLogin: true });
+      }
+    } catch (err) {
+      setAuthError(err.response?.data?.error || "Auth failed");
+    }
+  };
+
+  const handleLogout = () => {
+    setToken("");
+    localStorage.removeItem("token");
+    setPdfs([]);
+    setChatHistory([]);
+    setSelectedDocs([]);
+  };
+
   // ===============================
   // Upload
   // ===============================
@@ -46,7 +103,7 @@ function App() {
     formData.append("file", file);
 
     try {
-      const res = await axios.post(`${API_BASE}/upload`, formData);
+      const res = await api.post("/upload", formData);
       const url = URL.createObjectURL(file);
 
       setPdfs(prev => [
@@ -85,7 +142,7 @@ function App() {
     setAsking(true);
 
     try {
-      const res = await axios.post(`${API_BASE}/ask`, {
+      const res = await api.post("/ask", {
         question,
         doc_ids: selectedDocs
       });
@@ -114,7 +171,7 @@ function App() {
     setSummarizing(true);
 
     try {
-      const res = await axios.post(`${API_BASE}/summarize`, {
+      const res = await api.post("/summarize", {
         doc_ids: selectedDocs
       });
 
@@ -138,14 +195,14 @@ function App() {
     setComparing(true);
 
     try {
-      const res = await axios.post(`${API_BASE}/compare`, {
+      const res = await api.post("/compare", {
         doc_ids: selectedDocs
       });
 
       // If exactly 2 → show structured side view
       if (selectedDocs.length === 2) {
         setComparisonResult(res.data.comparison);
-      } 
+      }
       // If more than 2 → push to chat mode
       else {
         setChatHistory(prev => [
@@ -168,18 +225,62 @@ function App() {
 
   const themeClass = darkMode ? "bg-dark text-light" : "bg-light text-dark";
 
-  const toggleTheme = () => {
-    setDarkMode(!darkMode);
-  };
+  if (!token) {
+    return (
+      <div className={themeClass} style={{ minHeight: "100vh", display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+        <Card style={{ width: '400px' }}>
+          <Card.Body>
+            <h3 className="text-center mb-4">{authForm.isLogin ? "Login" : "Register"}</h3>
+            {authError && <div className="alert alert-danger">{authError}</div>}
+            <Form onSubmit={handleAuth}>
+              <Form.Group className="mb-3">
+                <Form.Label>Email</Form.Label>
+                <Form.Control
+                  type="email"
+                  value={authForm.email}
+                  onChange={e => setAuthForm({ ...authForm, email: e.target.value })}
+                  required
+                />
+              </Form.Group>
+              <Form.Group className="mb-3">
+                <Form.Label>Password</Form.Label>
+                <Form.Control
+                  type="password"
+                  value={authForm.password}
+                  onChange={e => setAuthForm({ ...authForm, password: e.target.value })}
+                  required
+                />
+              </Form.Group>
+              <Button type="submit" variant="primary" className="w-100">
+                {authForm.isLogin ? "Login" : "Register"}
+              </Button>
+            </Form>
+            <Button
+              variant="link"
+              className="w-100 mt-2"
+              onClick={() => setAuthForm({ ...authForm, isLogin: !authForm.isLogin })}
+            >
+              {authForm.isLogin ? "Need an account? Register" : "Have an account? Login"}
+            </Button>
+          </Card.Body>
+        </Card>
+      </div>
+    );
+  }
 
   return (
     <div className={themeClass} style={{ minHeight: "100vh" }}>
       <Navbar bg={darkMode ? "dark" : "primary"} variant="dark">
         <Container>
           <Navbar.Brand>PDF Q&A Bot</Navbar.Brand>
-          <Button variant="outline-light" onClick={() => setDarkMode(!darkMode)}>
-            Toggle Theme
-          </Button>
+          <div>
+            <Button variant="outline-light" className="me-2" onClick={() => setDarkMode(!darkMode)}>
+              Toggle Theme
+            </Button>
+            <Button variant="outline-danger" onClick={handleLogout}>
+              Logout
+            </Button>
+          </div>
         </Container>
       </Navbar>
 
