@@ -1,0 +1,25 @@
+﻿git : You are not currently 
+on a branch.
+At line:1 char:35
++ ... t status > 
+git_status.txt 2>&1; git 
+pull --rebase > 
+git_pull.txt 2>&1
++                           
+          ~~~~~~~~~~~~~~~~~~
+~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          
+    : NotSpecified: (You a  
+  re not currently on a b   
+ ranch.:String) [], Remo    
+teException
+    + FullyQualifiedErrorId 
+    : NativeCommandError
+ 
+Please specify which branch 
+you want to rebase against.
+See git-pull(1) for details.
+
+    git pull <remote> 
+<branch>
+

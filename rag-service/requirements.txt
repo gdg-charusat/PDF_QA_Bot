@@ -4,10 +4,27 @@ python-dotenv
 pydantic
 langchain
 langchain-community
+langchain-core
 langchain-text-splitters
+langchain-core
 sentence-transformers
-transformers
 faiss-cpu
 pypdf
+python-docx
 requests
 numpy
+slowapi
+
+# Authentication dependencies
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
+sqlalchemy
+alembic
+
+# Testing dependencies
+pytest
+pytest-asyncio
+httpx
+pytest-mock
+groq

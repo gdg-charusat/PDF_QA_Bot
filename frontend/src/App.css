@@ -32,7 +32,231 @@
   from {
     transform: rotate(0deg);
   }
+
   to {
     transform: rotate(360deg);
   }
 }
+
+/* Dark Mode Styles */
+.app-container {
+  transition:
+    background-color 0.3s ease,
+    color 0.3s ease;
+}
+
+/* Theme Toggle Styles */
+.theme-toggle-container {
+  padding: 4px 8px;
+  border-radius: 8px;
+  background-color: rgba(0, 0, 0, 0.05);
+}
+
+/* PDF Status Alerts */
+.alert-info {
+  border-left: 4px solid #17a2b8;
+  border-radius: 8px;
+  transition: all 0.3s ease;
+}
+
+.alert-info:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+.theme-toggle-group {
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.theme-btn {
+  font-size: 0.875rem;
+  padding: 0.375rem 0.75rem;
+  transition: all 0.2s ease;
+}
+
+.theme-btn:hover {
+  transform: translateY(-1px);
+}
+
+/* Chat Message Styles */
+.chat-messages {
+  transition: background-color 0.3s ease;
+}
+
+.chat-messages::-webkit-scrollbar {
+  width: 8px;
+}
+
+.chat-messages-light::-webkit-scrollbar-track {
+  background: #f1f1f1;
+  border-radius: 10px;
+}
+
+.chat-messages-light::-webkit-scrollbar-thumb {
+  background: #888;
+  border-radius: 10px;
+}
+
+.chat-messages-light::-webkit-scrollbar-thumb:hover {
+  background: #555;
+}
+
+.chat-messages-dark::-webkit-scrollbar-track {
+  background: #2d2d2d;
+  border-radius: 10px;
+}
+
+.chat-messages-dark::-webkit-scrollbar-thumb {
+  background: #555;
+  border-radius: 10px;
+}
+
+.chat-messages-dark::-webkit-scrollbar-thumb:hover {
+  background: #777;
+}
+
+/* Markdown Content Styles */
+.markdown-content {
+  font-size: 0.95rem;
+  line-height: 1.6;
+}
+
+.markdown-content p {
+  margin-bottom: 0.5rem;
+}
+
+.markdown-content code {
+  background-color: rgba(0, 0, 0, 0.1);
+  padding: 2px 6px;
+  border-radius: 3px;
+  font-size: 0.9em;
+}
+
+.markdown-content pre {
+  background-color: rgba(0, 0, 0, 0.05);
+  padding: 10px;
+  border-radius: 5px;
+  overflow-x: auto;
+}
+
+/* Dark mode specific markdown styles */
+.bg-dark .markdown-content code {
+  background-color: rgba(255, 255, 255, 0.1);
+}
+
+.bg-dark .markdown-content pre {
+  background-color: rgba(255, 255, 255, 0.05);
+}
+
+/* Card Styles */
+.card {
+  transition: all 0.3s ease;
+}
+
+.card:hover {
+  transform: translateY(-2px);
+}
+
+/* Button Styles */
+.btn {
+  transition: all 0.2s ease;
+}
+
+/* Dropdown Dark Mode Support */
+.dark-mode .dropdown-menu {
+  background-color: #343a40;
+  border-color: #495057;
+}
+
+.dark-mode .dropdown-item {
+  color: #f8f9fa;
+}
+
+.dark-mode .dropdown-item:hover {
+  background-color: #495057;
+  color: #ffffff;
+}
+
+/* Form Control Dark Mode */
+.dark-mode .form-control {
+  background-color: #2d2d2d;
+  border-color: #495057;
+  color: #f8f9fa;
+}
+
+.dark-mode .form-control:focus {
+  background-color: #2d2d2d;
+  border-color: #6c757d;
+  color: #f8f9fa;
+  box-shadow: 0 0 0 0.2rem rgba(108, 117, 125, 0.25);
+}
+
+.dark-mode .form-control::placeholder {
+  color: #adb5bd;
+}
+
+/* Shadow Styles */
+.shadow {
+  box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075) !important;
+}
+
+.dark-mode .shadow {
+  box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.5) !important;
+}
+
+.shadow-sm {
+  box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.075) !important;
+}
+
+.dark-mode .shadow-sm {
+  box-shadow: 0 0.125rem 0.25rem rgba(0, 0, 0, 0.5) !important;
+}
+
+/* PDF Viewer Container */
+.react-pdf__Page {
+  display: flex;
+  justify-content: center;
+  margin: 10px 0;
+}
+
+.react-pdf__Page__canvas {
+  max-width: 100%;
+  height: auto !important;
+  border-radius: 8px;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+}
+
+.dark-mode .react-pdf__Page__canvas {
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.5);
+}
+
+/* Responsive Design */
+@media (max-width: 768px) {
+  .theme-toggle-container {
+    font-size: 0.8rem;
+  }
+
+  .theme-btn {
+    font-size: 0.75rem;
+    padding: 0.25rem 0.5rem;
+  }
+
+  .chat-messages {
+    max-height: 200px !important;
+  }
+}
+
+/* Animation for theme transition */
+* {
+  transition:
+    background-color 0.3s ease,
+    border-color 0.3s ease;
+}
+
+/* Smooth scroll for chat */
+.chat-messages {
+  scroll-behavior: smooth;
+}
+
+

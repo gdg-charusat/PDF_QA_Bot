@@ -1,0 +1,60 @@
+a180ea2 fix: resolve cross-document context leakage by replacing global vectorstore with session-isolated FAISS stores
+7eb06bb fix: finalize conflict resolution in rag-service main.py
+30adb2f Resolve conflicts: Integrated Groq LLM, session-based RAG, and fixed server logic
+31928d3 fix: finalize conflict resolution in rag-service main.py
+a99a082 Merge branch 'master' into feature/ccc-response-format
+6fd3b48 Merge branch 'feature/ccc-response-format-fixed' into feature/ccc-response-format
+e46014c feat: replace HuggingFace/torch generation with Groq API (llama-3.3-70b-versatile)
+a65dab3 Merge pull request #35 from dhruvpatel848/fix-data-leakage
+c9ae18f Merge branch 'master' into fix-data-leakage
+46fc3b6 Resolve merge conflicts: integrate multi-doc, comparison, dark mode persistence, text normalization with session-based isolation
+3d3c346 Merge pull request #46 from Mathakiya-Amal/docs/generalize-readme-paths
+a9f4aae Merge pull request #44 from kevaljogani/master
+34dfc95 Merge branch 'master' into master
+f2db465 Fix Data Leakage / Cross-User Session Confusion in RAG Architecture - T082
+15d95aa Merge pull request #25 from JainiSolanki/main
+c9db50e Merge branch 'master' into main
+4d8dd38 Updated App.ja
+9acd26c Merge branch 'master' into master
+fa4cbeb API key added in prject of groq
+365c45c Merge pull request #41 from Akshat14z/feature/Added-Rate-Limiter
+145f582 Merge pull request #27 from unnatii14/master
+8acbdaf Merge branch 'main' of https://github.com/JainiSolanki/PDF_QA_Bot
+21d7436 WIP on main: cc51d1d added groq api key and LLM
+89a0e14 index on main: cc51d1d added groq api key and LLM
+b62dbce feat:Added API Rate Limiting to Prevent Resource Exhaustion
+177999e fix: implement session-based chat history to prevent data sharing between users
+cc51d1d added groq api key and LLM
+c9b5e78 feat: add Clear History button to chat interface
+12b5734 fix: remove binary files from git, add uploads to .gitignore, restore askLimiter middleware on /ask route
+9681a10 Issue 45 solved
+0ea7a79 issue 45 solved
+17ce7d2 docs: generalize README path examples
+0573daa feat: UI improvements - dark/light theme, navbar, and UX fixes
+54b3cdc feat:Added API Rate Limiting to Prevent Resource Exhaustion
+62d3a7f Merge branch 'master' into master
+4fba252 added clear history button
+3e4557e added history and changed prompt of the LLM
+46951b9 Add PDF upload state tracking functionality
+55e9950 Merge pull request #19 from vraj826/feature/multi-pdf-comparison
+a703588 changes done for making the server run
+6146926 Merge branch 'master' into feature/multi-pdf-comparison
+5d72137 feat: add multi-PDF comparison, cross-document QA, similarity matrix, and side-by-side comparison UI
+a1c6f0c Merge pull request #12 from Krish3017/feature/dark-mode-toggle
+11c1ffe Merge branch 'master' into feature/dark-mode-toggle
+dd16f63 Merge pull request #13 from vasu-CE/feat/rate-limiter
+d741f29  Dark Mode Toggle Feature Added
+964c336 Implement rate limiting for PDF upload, question asking, and summarization endpoints
+692f804 Revise CONTRIBUTING.md for improved instructions
+c214ed8 Refactor Tech Stack section in CONTRIBUTING.md
+edbd025 Add tech stack information to CONTRIBUTING.md
+60bca68 Revise Code of Conduct
+de29a7d Add Code of Conduct
+c80cbe2 Revise CONTRIBUTING.md with updated guidelines and structure
+d40f08c Rename CODEOWNERS.txt to CODEOWNERS
+dd39584 Add files via upload
+d83631d Create pr-validator.yml
+cf07a86 Create pull request template for contributors
+191a1bb Updated README.md
+666963f sensitive info deleted
+62c1231 Project added

@@ -1,149 +1,296 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
+from fastapi import FastAPI, Request, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain_core.documents import Document
 from dotenv import load_dotenv
-import os
-import uvicorn
-import torch
 from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from uuid import uuid4
+import os
+import time
+import uuid
+import torch
+import uvicorn
+
+# IMPORTANT: Authentication REMOVED as per issue requirement
+# (Authentication was breaking existing endpoints)
 
 load_dotenv()
 
-app = FastAPI()
+app = FastAPI(
+    title="PDF QA Bot API",
+    description="PDF Question-Answering Bot (Session-based, No Auth)",
+    version="2.1.0"
+)
 
-# Temporary global variables
-vectorstore = None
-qa_chain = False
-HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-base")
-generation_tokenizer = None
-generation_model = None
-generation_is_encoder_decoder = False
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-# Load local embedding model
-embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+# Rate Limiter
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# ===============================
+# SESSION STORAGE (REQUIRED: keep sessionId)
+# ===============================
+# Format: { session_id: { "vectorstores": [FAISS], "last_accessed": float } }
+sessions = {}
+SESSION_TIMEOUT = 3600  # 1 hour
 
-def load_generation_model():
-    global generation_tokenizer, generation_model, generation_is_encoder_decoder
-    if generation_model is not None and generation_tokenizer is not None:
-        return generation_tokenizer, generation_model, generation_is_encoder_decoder
+# Embedding model (loaded once)
+embedding_model = HuggingFaceEmbeddings(
+    model_name="sentence-transformers/all-MiniLM-L6-v2"
+)
 
-    config = AutoConfig.from_pretrained(HF_GENERATION_MODEL)
-    generation_is_encoder_decoder = bool(getattr(config, "is_encoder_decoder", False))
-    generation_tokenizer = AutoTokenizer.from_pretrained(HF_GENERATION_MODEL)
+# ===============================
+# LOAD GENERATION MODEL ONCE
+# ===============================
+HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-small")
 
-    if generation_is_encoder_decoder:
-        generation_model = AutoModelForSeq2SeqLM.from_pretrained(HF_GENERATION_MODEL)
-    else:
-        generation_model = AutoModelForCausalLM.from_pretrained(HF_GENERATION_MODEL)
+config = AutoConfig.from_pretrained(HF_GENERATION_MODEL)
+is_encoder_decoder = bool(getattr(config, "is_encoder_decoder", False))
+tokenizer = AutoTokenizer.from_pretrained(HF_GENERATION_MODEL)
 
-    if torch.cuda.is_available():
-        generation_model = generation_model.to("cuda")
+if is_encoder_decoder:
+    model = AutoModelForSeq2SeqLM.from_pretrained(HF_GENERATION_MODEL)
+else:
+    model = AutoModelForCausalLM.from_pretrained(HF_GENERATION_MODEL)
 
-    generation_model.eval()
-    return generation_tokenizer, generation_model, generation_is_encoder_decoder
+if torch.cuda.is_available():
+    model = model.to("cuda")
 
+model.eval()
 
-def generate_response(prompt: str, max_new_tokens: int) -> str:
-    tokenizer, model, is_encoder_decoder = load_generation_model()
-    model_device = next(model.parameters()).device
-
-    encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
-    encoded = {key: value.to(model_device) for key, value in encoded.items()}
-    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-
-    with torch.no_grad():
-        generated_ids = model.generate(
-            **encoded,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            pad_token_id=pad_token_id,
-        )
-
-    if is_encoder_decoder:
-        text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-        return text.strip()
-
-    input_len = encoded["input_ids"].shape[1]
-    new_tokens = generated_ids[0][input_len:]
-    text = tokenizer.decode(new_tokens, skip_special_tokens=True)
-    return text.strip()
-
-class PDFPath(BaseModel):
-    filePath: str
-
-class Question(BaseModel):
-    question: str
+# ===============================
+# REQUEST MODELS
+# ===============================
+class AskRequest(BaseModel):
+    question: str = Field(..., min_length=1)
+    session_ids: list = []
 
 
 class SummarizeRequest(BaseModel):
-    pdf: str | None = None
-
-@app.post("/process-pdf")
-def process_pdf(data: PDFPath):
-    global vectorstore, qa_chain
-
-    loader = PyPDFLoader(data.filePath)
-    docs = loader.load()
-
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
-    chunks = splitter.split_documents(docs)
-    if not chunks:
-            return {"error": "No text chunks generated from the PDF. Please check your file."}
-    vectorstore = FAISS.from_documents(chunks, embedding_model)
-
-    qa_chain = True  # Just a flag to indicate PDF is processed
-
-    return {"message": "PDF processed successfully"}
+    session_ids: list = []
 
 
+class CompareRequest(BaseModel):
+    session_ids: list = []
+
+
+# ===============================
+# UTILITIES
+# ===============================
+def cleanup_expired_sessions():
+    current_time = time.time()
+    expired = [
+        sid for sid, data in sessions.items()
+        if current_time - data["last_accessed"] > SESSION_TIMEOUT
+    ]
+    for sid in expired:
+        del sessions[sid]
+
+
+def generate_response(prompt: str, max_new_tokens: int = 200) -> str:
+    device = next(model.parameters()).device
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    output = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+    )
+
+    if is_encoder_decoder:
+        return tokenizer.decode(output[0], skip_special_tokens=True)
+
+    return tokenizer.decode(
+        output[0][inputs["input_ids"].shape[1]:],
+        skip_special_tokens=True,
+    )
+
+
+# ===============================
+# HEALTH ENDPOINTS (kept from enhancement branch)
+# ===============================
+@app.get("/healthz")
+def health_check():
+    return {"status": "healthy"}
+
+
+@app.get("/readyz")
+def readiness_check():
+    return {"status": "ready"}
+
+
+# ===============================
+# UPLOAD (NO AUTH, RETURNS session_id)
+# ===============================
+@app.post("/upload")
+@limiter.limit("10/15 minutes")
+async def upload_file(request: Request, file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        return {"error": "Only PDF files are supported"}
+
+    session_id = str(uuid4())
+    upload_dir = "uploads"
+    os.makedirs(upload_dir, exist_ok=True)
+    file_path = os.path.join(upload_dir, f"{uuid4().hex}_{file.filename}")
+
+    try:
+        with open(file_path, "wb") as buffer:
+            buffer.write(await file.read())
+
+        loader = PyPDFLoader(file_path)
+        docs = loader.load()
+
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=100
+        )
+        chunks = splitter.split_documents(docs)
+
+        vectorstore = FAISS.from_documents(chunks, embedding_model)
+
+        sessions[session_id] = {
+            "vectorstores": [vectorstore],
+            "last_accessed": time.time()
+        }
+
+        return {
+            "message": "PDF uploaded and processed",
+            "session_id": session_id
+        }
+
+    except Exception as e:
+        return {"error": f"Upload failed: {str(e)}"}
+
+
+# ===============================
+# ASK (USES session_ids — matches fixed App.js)
+# ===============================
 @app.post("/ask")
-def ask_question(data: Question):
-    global vectorstore, qa_chain
-    if not qa_chain:
-        return {"answer": "Please upload a PDF first!"}
+@limiter.limit("60/15 minutes")
+def ask_question(request: Request, data: AskRequest):
+    cleanup_expired_sessions()
 
-    docs = vectorstore.similarity_search(data.question, k=4)
+    if not data.session_ids:
+        return {"answer": "No session selected."}
+
+    vectorstores = []
+    for sid in data.session_ids:
+        session = sessions.get(sid)
+        if session:
+            session["last_accessed"] = time.time()
+            vectorstores.extend(session["vectorstores"])
+
+    if not vectorstores:
+        return {"answer": "No documents found for selected sessions."}
+
+    docs = []
+    for vs in vectorstores:
+        docs.extend(vs.similarity_search(data.question, k=4))
+
     if not docs:
         return {"answer": "No relevant context found."}
 
-    context = "\n\n".join([doc.page_content for doc in docs])
+    context = "\n\n".join([d.page_content for d in docs])
 
     prompt = (
-        "You are a helpful assistant for question answering over PDF documents. "
-        "Use only the provided context. If the context does not contain the answer, say so briefly.\n\n"
+        "Answer the question using ONLY the provided context.\n\n"
         f"Context:\n{context}\n\n"
-        f"Question: {data.question}\n"
-        "Answer:"
+        f"Question: {data.question}\nAnswer:"
     )
 
-    answer = generate_response(prompt, max_new_tokens=256)
+    answer = generate_response(prompt, 200)
     return {"answer": answer}
 
 
+# ===============================
+# SUMMARIZE
+# ===============================
 @app.post("/summarize")
-def summarize_pdf(_: SummarizeRequest):
-    global vectorstore, qa_chain
-    if not qa_chain:
-        return {"summary": "Please upload a PDF first!"}
+@limiter.limit("15/15 minutes")
+def summarize_pdf(request: Request, data: SummarizeRequest):
+    cleanup_expired_sessions()
 
-    docs = vectorstore.similarity_search("Give a concise summary of the document.", k=6)
-    if not docs:
-        return {"summary": "No document context available to summarize."}
+    if not data.session_ids:
+        return {"summary": "No session selected."}
 
-    context = "\n\n".join([doc.page_content for doc in docs])
-    prompt = (
-        "Summarize the following document content in 6-8 concise bullet points.\n\n"
-        f"Context:\n{context}\n\n"
-        "Summary:"
-    )
+    vectorstores = []
+    for sid in data.session_ids:
+        session = sessions.get(sid)
+        if session:
+            vectorstores.extend(session["vectorstores"])
 
-    summary = generate_response(prompt, max_new_tokens=220)
+    if not vectorstores:
+        return {"summary": "No documents found."}
+
+    docs = []
+    for vs in vectorstores:
+        docs.extend(vs.similarity_search("Summarize the document", k=6))
+
+    context = "\n\n".join([d.page_content for d in docs])
+
+    prompt = f"Summarize this document:\n\n{context}\n\nSummary:"
+    summary = generate_response(prompt, 250)
+
     return {"summary": summary}
 
 
+# ===============================
+# COMPARE
+# ===============================
+@app.post("/compare")
+@limiter.limit("10/15 minutes")
+def compare_documents(request: Request, data: CompareRequest):
+    cleanup_expired_sessions()
+
+    if len(data.session_ids) < 2:
+        return {"comparison": "Select at least 2 documents."}
+
+    contexts = []
+    for sid in data.session_ids:
+        session = sessions.get(sid)
+        if session:
+            vs = session["vectorstores"][0]
+            chunks = vs.similarity_search("main topics", k=4)
+            text = "\n".join([c.page_content for c in chunks])
+            contexts.append(text)
+
+    if len(contexts) < 2:
+        return {"comparison": "Not enough documents to compare."}
+
+    combined = "\n\n---\n\n".join(contexts)
+
+    prompt = (
+        "Compare the documents below.\n"
+        "Give similarities and differences.\n\n"
+        f"{combined}\n\nComparison:"
+    )
+
+    comparison = generate_response(prompt, 300)
+    return {"comparison": comparison}
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=5000)

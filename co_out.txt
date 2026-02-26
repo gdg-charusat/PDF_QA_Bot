@@ -1,0 +1,4 @@
+M	rag-service/main.py
+Your branch is ahead of 'origin/master' by 5 commits.
+  (use "git push" to publish your local commits)
+Switched to branch 'main'

@@ -12,6 +12,26 @@ function App() {
   const [uploading, setUploading] = useState(false);
   const [asking, setAsking] = useState(false);
 
+  const handleFileChange = (event) => {
+    const selectedFile = event.target.files && event.target.files[0];
+    if (!selectedFile) {
+      setFile(null);
+      return;
+    }
+
+    const isPdfExt = selectedFile.name.toLowerCase().endsWith(".pdf");
+    const isPdfMime = selectedFile.type === "application/pdf";
+
+    if (!isPdfExt || !isPdfMime) {
+      alert("Only PDF files are supported.");
+      event.target.value = "";
+      setFile(null);
+      return;
+    }
+
+    setFile(selectedFile);
+  };
+
   const uploadPDF = async () => {
     if (!file) return;
     setUploading(true);
@@ -40,6 +60,15 @@ function App() {
     setAsking(false);
   };
 
+  const clearHistory = async () => {
+    try {
+      await axios.post("http://localhost:4000/clear-history");
+      setChat([]);
+    } catch (e) {
+      alert("Failed to clear history.");
+    }
+  };
+
   return (
     <Container maxWidth="sm">
       <AppBar position="static" color="primary" sx={{ mb: 2 }}>
@@ -58,7 +87,12 @@ function App() {
             disabled={uploading}
           >
             Upload PDF
-            <input type="file" hidden onChange={(e) => setFile(e.target.files[0])} />
+            <input
+              type="file"
+              hidden
+              accept=".pdf,application/pdf"
+              onChange={handleFileChange}
+            />
           </Button>
           <Button variant="outlined" onClick={uploadPDF} disabled={!file || uploading}>
             {uploading ? <CircularProgress size={24} /> : "Submit"}
@@ -68,7 +102,17 @@ function App() {
       </Paper>
 
       <Paper elevation={3} sx={{ p: 3, mb: 2, minHeight: 300 }}>
-        <Typography variant="subtitle1" gutterBottom>Chat</Typography>
+        <Box display="flex" justifyContent="space-between" alignItems="center" mb={2}>
+          <Typography variant="subtitle1">Chat</Typography>
+          <Button
+            variant="outlined"
+            size="small"
+            onClick={clearHistory}
+            disabled={chat.length === 0}
+          >
+            Clear History
+          </Button>
+        </Box>
         <Box sx={{ maxHeight: 250, overflowY: "auto", mb: 2 }}>
           {chat.map((msg, i) => (
             <Box key={i} display="flex" justifyContent={msg.role === "user" ? "flex-end" : "flex-start"} mb={1}>

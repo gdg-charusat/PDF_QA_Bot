@@ -5,9 +5,67 @@ body {
     sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  transition: background-color 0.3s ease, color 0.3s ease;
 }
 
 code {
   font-family: source-code-pro, Menlo, Monaco, Consolas, 'Courier New',
     monospace;
+}
+
+/* Global Dark Mode Styles */
+body.dark-mode {
+  background-color: #1a1a1a;
+  color: #f8f9fa;
+}
+
+/* Ensure smooth transitions */
+body,
+body * {
+  transition-property: background-color, border-color, color;
+  transition-duration: 0.3s;
+  transition-timing-function: ease;
+}
+
+/* Prevent transition on page load */
+body.preload * {
+  transition: none !important;
+}
+
+/* Custom scrollbar for the entire page */
+::-webkit-scrollbar {
+  width: 12px;
+}
+
+::-webkit-scrollbar-track {
+  background: #f1f1f1;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #888;
+  border-radius: 6px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #555;
+}
+
+/* Dark mode scrollbar */
+body.dark-mode ::-webkit-scrollbar-track {
+  background: #2d2d2d;
+}
+
+body.dark-mode ::-webkit-scrollbar-thumb {
+  background: #555;
+}
+
+body.dark-mode ::-webkit-scrollbar-thumb:hover {
+  background: #777;
+}
+
+input.placeholder-white::placeholder,
+textarea.placeholder-white::placeholder {
+  color: #adb5bd !important;
+  opacity: 1 !important;
+  -webkit-text-fill-color: #adb5bd !important;
 }
