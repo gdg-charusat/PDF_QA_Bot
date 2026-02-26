@@ -16,9 +16,13 @@ from transformers import (
 )
 from slowapi import Limiter
 from slowapi.util import get_remote_address
+from pathlib import Path
 import os 
 import re
 import uvicorn
+import torch
+import time
+import docx
 from slowapi import Limiter
 from slowapi.util import get_remote_address
 import threading
@@ -43,12 +47,32 @@ HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-small")
 LLM_GENERATION_TIMEOUT = int(os.getenv("LLM_GENERATION_TIMEOUT", "30"))
 SESSION_TIMEOUT = 3600
 
+# ===============================
+# QUERY CONDENSATION PROMPT
+# ===============================
+CONDENSE_QUESTION_PROMPT = """Given the following conversation history and a follow-up question, 
+rewrite the follow-up question to be a standalone, self-contained question that can be understood 
+without the conversation history. Replace pronouns (it, they, this, that, he, she) with the actual 
+entities they refer to from the conversation history.
+
+Conversation History:
+{history}
+
+Follow-up Question: {question}
+
+Standalone Question:"""
+
 # ---------------------------------------------------------------------------
 # GLOBAL STATE MANAGEMENT (Thread-safe, Multi-user support)
 # ---------------------------------------------------------------------------
 # Per-user/session storage with proper cleanup and locking
 sessions = {}  # {session_id: {"vectorstore": FAISS, "upload_time": datetime}}
 sessions_lock = threading.RLock()  # Thread-safe access to sessions
+
+# Generation model globals (lazy-loaded)
+generation_model = None
+generation_tokenizer = None
+generation_is_encoder_decoder = None
 
 # Load local embedding model (unchanged — FAISS retrieval stays the same)
 embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
@@ -116,6 +140,44 @@ def normalize_answer(text: str) -> str:
     text = normalize_spaced_text(text)
     text = re.sub(r"^(Answer[^:]*:|Context:|Question:)\s*", "", text, flags=re.I)
     return text.strip()
+
+
+def condense_question(question: str, history: list) -> str:
+    """
+    Condense a follow-up question using conversation history into a standalone query.
+    This handles pronouns and context-dependent references.
+    """
+    if not history or len(history) < 1:
+        return question
+    
+    # Build history context from last 3-5 messages
+    history_text = ""
+    for msg in history[-5:]:
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role and content:
+            history_text += f"{role}: {content}\n"
+    
+    if not history_text.strip():
+        return question
+    
+    # Use LLM to rewrite the question
+    prompt = CONDENSE_QUESTION_PROMPT.format(
+        history=history_text.strip(),
+        question=question
+    )
+    
+    try:
+        condensed = generate_response(prompt, max_new_tokens=128)
+        condensed = condensed.strip()
+        
+        # Return condensed question if valid, otherwise original
+        if condensed and len(condensed) > 3:
+            return condensed
+    except Exception:
+        pass
+    
+    return question
 
 
 # ===============================
@@ -315,8 +377,11 @@ def ask_question(request: Request, data: AskRequest):
                     if role and content:
                         conversation_context += f"{role}: {content}\n"
             
-            # Search only within current session's vectorstore
-            docs = vectorstore.similarity_search(question, k=4)
+            # QUERY CONDENSATION: Rewrite question to standalone form using history
+            standalone_query = condense_question(question, history)
+            
+            # Search only within current session's vectorstore using condensed query
+            docs = vectorstore.similarity_search(standalone_query, k=4)
             if not docs:
                 return {"answer": "No relevant context found in the current PDF."}
 
