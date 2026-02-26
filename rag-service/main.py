@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, File, UploadFile
+from fastapi import FastAPI, Request, File, UploadFile, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from langchain_community.document_loaders import PyPDFLoader
@@ -18,18 +18,37 @@ import uuid
 import torch
 import uvicorn
 
-# IMPORTANT: Authentication REMOVED as per issue requirement
-# (Authentication was breaking existing endpoints)
+# ── Authentication ─────────────────────────────────────────────────────────────
+from database import Base, engine, get_db
+from auth.router import router as auth_router
+from auth.middleware import (
+    get_current_user,
+    require_upload_permission,
+    require_ask_permission,
+    require_summarize_permission,
+    require_compare_permission,
+)
+from auth.models import User
 
 load_dotenv()
 
+# Create database tables on startup
+Base.metadata.create_all(bind=engine)
+
 app = FastAPI(
     title="PDF QA Bot API",
-    description="PDF Question-Answering Bot (Session-based, No Auth)",
-    version="2.1.0"
+    description=(
+        "PDF Question-Answering Bot with JWT Authentication and Role-Based Access Control. "
+        "All PDF processing endpoints require a valid Bearer token. "
+        "Register at /auth/register and login at /auth/login to obtain a token."
+    ),
+    version="2.2.0"
 )
 
-# CORS
+# ── Include auth router ────────────────────────────────────────────────────────
+app.include_router(auth_router)
+
+# ── CORS ───────────────────────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -38,26 +57,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Rate Limiter
+# ── Rate Limiter ───────────────────────────────────────────────────────────────
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# ===============================
-# SESSION STORAGE (REQUIRED: keep sessionId)
-# ===============================
+# ── Session Storage ────────────────────────────────────────────────────────────
 # Format: { session_id: { "vectorstores": [FAISS], "last_accessed": float } }
 sessions = {}
 SESSION_TIMEOUT = 3600  # 1 hour
 
-# Embedding model (loaded once)
+# ── Embedding model (loaded once) ──────────────────────────────────────────────
 embedding_model = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
 
-# ===============================
-# LOAD GENERATION MODEL ONCE
-# ===============================
+# ── Generation model ───────────────────────────────────────────────────────────
 HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-small")
 
 config = AutoConfig.from_pretrained(HF_GENERATION_MODEL)
@@ -74,9 +89,7 @@ if torch.cuda.is_available():
 
 model.eval()
 
-# ===============================
-# REQUEST MODELS
-# ===============================
+# ── Request models ─────────────────────────────────────────────────────────────
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1)
     session_ids: list = []
@@ -90,9 +103,7 @@ class CompareRequest(BaseModel):
     session_ids: list = []
 
 
-# ===============================
-# UTILITIES
-# ===============================
+# ── Utilities ──────────────────────────────────────────────────────────────────
 def cleanup_expired_sessions():
     current_time = time.time()
     expired = [
@@ -124,25 +135,36 @@ def generate_response(prompt: str, max_new_tokens: int = 200) -> str:
     )
 
 
-# ===============================
-# HEALTH ENDPOINTS (kept from enhancement branch)
-# ===============================
-@app.get("/healthz")
+# ── Health Endpoints (public — no auth required) ───────────────────────────────
+@app.get("/healthz", tags=["Health"])
 def health_check():
     return {"status": "healthy"}
 
 
-@app.get("/readyz")
+@app.get("/readyz", tags=["Health"])
 def readiness_check():
     return {"status": "ready"}
 
 
-# ===============================
-# UPLOAD (NO AUTH, RETURNS session_id)
-# ===============================
-@app.post("/upload")
+@app.get("/health", tags=["Health"])
+def health():
+    return {"status": "ok"}
+
+
+# ── Upload (🔐 Requires auth — upload_pdf permission) ──────────────────────────
+@app.post("/upload", tags=["PDF Processing"])
 @limiter.limit("10/15 minutes")
-async def upload_file(request: Request, file: UploadFile = File(...)):
+async def upload_file(
+    request: Request,
+    file: UploadFile = File(...),
+    current_user: User = Depends(require_upload_permission),
+):
+    """
+    Upload and process a PDF file. Returns a session_id used for subsequent
+    /ask, /summarize, and /compare requests.
+
+    Requires authentication. User role requires 'upload_pdf' permission.
+    """
     if not file.filename.lower().endswith(".pdf"):
         return {"error": "Only PDF files are supported"}
 
@@ -173,19 +195,27 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
 
         return {
             "message": "PDF uploaded and processed",
-            "session_id": session_id
+            "session_id": session_id,
+            "uploaded_by": current_user.username,
         }
 
     except Exception as e:
         return {"error": f"Upload failed: {str(e)}"}
 
 
-# ===============================
-# ASK (USES session_ids — matches fixed App.js)
-# ===============================
-@app.post("/ask")
+# ── Ask (🔐 Requires auth — ask_question permission) ───────────────────────────
+@app.post("/ask", tags=["PDF Processing"])
 @limiter.limit("60/15 minutes")
-def ask_question(request: Request, data: AskRequest):
+def ask_question(
+    request: Request,
+    data: AskRequest,
+    current_user: User = Depends(require_ask_permission),
+):
+    """
+    Ask a question about one or more uploaded PDFs identified by session_ids.
+
+    Requires authentication. User role requires 'ask_question' permission.
+    """
     cleanup_expired_sessions()
 
     if not data.session_ids:
@@ -220,12 +250,19 @@ def ask_question(request: Request, data: AskRequest):
     return {"answer": answer}
 
 
-# ===============================
-# SUMMARIZE
-# ===============================
-@app.post("/summarize")
+# ── Summarize (🔐 Requires auth — summarize permission) ────────────────────────
+@app.post("/summarize", tags=["PDF Processing"])
 @limiter.limit("15/15 minutes")
-def summarize_pdf(request: Request, data: SummarizeRequest):
+def summarize_pdf(
+    request: Request,
+    data: SummarizeRequest,
+    current_user: User = Depends(require_summarize_permission),
+):
+    """
+    Summarize one or more uploaded PDFs identified by session_ids.
+
+    Requires authentication. User role requires 'summarize' permission.
+    """
     cleanup_expired_sessions()
 
     if not data.session_ids:
@@ -252,12 +289,19 @@ def summarize_pdf(request: Request, data: SummarizeRequest):
     return {"summary": summary}
 
 
-# ===============================
-# COMPARE
-# ===============================
-@app.post("/compare")
+# ── Compare (🔐 Requires auth — compare_documents permission / admin only) ──────
+@app.post("/compare", tags=["PDF Processing"])
 @limiter.limit("10/15 minutes")
-def compare_documents(request: Request, data: CompareRequest):
+def compare_documents(
+    request: Request,
+    data: CompareRequest,
+    current_user: User = Depends(require_compare_permission),
+):
+    """
+    Compare two or more uploaded PDFs identified by session_ids.
+
+    Requires authentication. Admin role required ('compare_documents' permission).
+    """
     cleanup_expired_sessions()
 
     if len(data.session_ids) < 2:
@@ -285,11 +329,6 @@ def compare_documents(request: Request, data: CompareRequest):
 
     comparison = generate_response(prompt, 300)
     return {"comparison": comparison}
-
-
-@app.get("/health")
-def health():
-    return {"status": "ok"}
 
 
 if __name__ == "__main__":

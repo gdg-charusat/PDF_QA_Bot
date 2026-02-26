@@ -8,16 +8,20 @@ const rateLimit = require("express-rate-limit");
 const session = require("express-session");
 require("dotenv").config();
 
-const app = express(); // FIX: removed duplicate declaration
+const { requireAuth, requireRole } = require("./middleware/auth");
 
+const app = express();
 
 const PORT = process.env.PORT || 4000;
 const RAG_URL = process.env.RAG_SERVICE_URL || "http://localhost:5000";
-const SESSION_SECRET = process.env.SESSION_SECRET; // FIX: removed hardcoded secret
+const SESSION_SECRET = process.env.SESSION_SECRET;
 
 if (!SESSION_SECRET) {
   throw new Error("SESSION_SECRET must be set in environment variables");
 }
+
+// JWT_SECRET validation is handled inside middleware/auth.js — it throws at
+// require() time if the env var is missing, so no duplicate check needed here.
 
 
 app.set("trust proxy", 1);
@@ -51,6 +55,7 @@ const uploadLimiter = makeLimiter(5, "Too many PDF uploads, try again later.");
 const askLimiter = makeLimiter(30, "Too many questions, try again later.");
 const summarizeLimiter = makeLimiter(10, "Too many summarization requests.");
 const compareLimiter = makeLimiter(10, "Too many comparison requests.");
+const authLimiter = makeLimiter(20, "Too many authentication requests, try again later.");
 
 
 const UPLOAD_DIR = path.resolve(__dirname, "uploads");
@@ -69,6 +74,8 @@ const storage = multer.diskStorage({
 
 const upload = multer({ storage });
 
+
+// ── Health endpoints (public) ─────────────────────────────────────────────────
 
 app.get("/healthz", (req, res) => {
   res.status(200).json({ status: "healthy", service: "pdf-qa-gateway" });
@@ -94,8 +101,79 @@ app.get("/readyz", async (req, res) => {
   }
 });
 
+app.get("/health", (req, res) => {
+  res.json({ status: "ok" });
+});
 
-app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
+
+// ── Auth proxy routes (public — no JWT required) ──────────────────────────────
+// These forward register/login requests to the FastAPI RAG service which
+// manages the user database and issues JWT tokens.
+
+/**
+ * POST /auth/register
+ * Proxy → RAG_URL/auth/register
+ * Body: { username, email, password, full_name?, role? }
+ */
+app.post("/auth/register", authLimiter, async (req, res) => {
+  try {
+    const response = await axios.post(
+      `${RAG_URL}/auth/register`,
+      req.body,
+      { timeout: 10000 }
+    );
+    return res.status(response.status).json(response.data);
+  } catch (err) {
+    const status = err.response?.status || 500;
+    const data = err.response?.data || { error: "Registration failed." };
+    return res.status(status).json(data);
+  }
+});
+
+/**
+ * POST /auth/login
+ * Proxy → RAG_URL/auth/login
+ * Body: { username, password }
+ * Returns: { access_token, token_type, expires_in, user }
+ */
+app.post("/auth/login", authLimiter, async (req, res) => {
+  try {
+    const response = await axios.post(
+      `${RAG_URL}/auth/login`,
+      req.body,
+      { timeout: 10000 }
+    );
+    return res.status(response.status).json(response.data);
+  } catch (err) {
+    const status = err.response?.status || 500;
+    const data = err.response?.data || { error: "Login failed." };
+    return res.status(status).json(data);
+  }
+});
+
+/**
+ * GET /auth/me
+ * Proxy → RAG_URL/auth/me  (forwards the Bearer token on behalf of the client)
+ */
+app.get("/auth/me", requireAuth, async (req, res) => {
+  try {
+    const authHeader = req.headers["authorization"];
+    const response = await axios.get(`${RAG_URL}/auth/me`, {
+      headers: { Authorization: authHeader },
+      timeout: 10000,
+    });
+    return res.status(response.status).json(response.data);
+  } catch (err) {
+    const status = err.response?.status || 500;
+    const data = err.response?.data || { error: "Could not fetch user profile." };
+    return res.status(status).json(data);
+  }
+});
+
+
+// ── Protected PDF endpoints (JWT required) ─────────────────────────────────────
+
+app.post("/upload", requireAuth, uploadLimiter, upload.single("file"), async (req, res) => {
   try {
     if (!req.file) {
       return res.status(400).json({ error: "No file uploaded." });
@@ -130,7 +208,7 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
 });
 
 
-app.post("/ask", askLimiter, async (req, res) => {
+app.post("/ask", requireAuth, askLimiter, async (req, res) => {
   const { question, session_ids } = req.body;
 
   if (!question) return res.status(400).json({ error: "Missing question." });
@@ -153,7 +231,7 @@ app.post("/ask", askLimiter, async (req, res) => {
 });
 
 
-app.post("/summarize", summarizeLimiter, async (req, res) => {
+app.post("/summarize", requireAuth, summarizeLimiter, async (req, res) => {
   const { session_ids } = req.body;
 
   if (!session_ids || session_ids.length === 0) {
@@ -175,7 +253,8 @@ app.post("/summarize", summarizeLimiter, async (req, res) => {
 });
 
 
-app.post("/compare", compareLimiter, async (req, res) => {
+// compare is admin-only (managing/comparing all documents is an elevated action)
+app.post("/compare", requireAuth, requireRole("admin"), compareLimiter, async (req, res) => {
   const { session_ids } = req.body;
 
   if (!session_ids || session_ids.length < 2) {
@@ -196,10 +275,6 @@ app.post("/compare", compareLimiter, async (req, res) => {
   }
 });
 
-
-app.get("/health", (req, res) => {
-  res.json({ status: "ok" });
-});
 
 app.listen(PORT, () =>
   console.log(`Backend running on http://localhost:${PORT}`)

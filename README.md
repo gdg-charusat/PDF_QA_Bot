@@ -71,30 +71,45 @@ cd ../rag-service && python -m pip install -r requirements.txt
 
 ## 2) Environment Variables
 
-Create `.env` in repo root (or edit existing):
+Create `.env` files in the relevant directories (or a single root `.env` loaded by each service):
+
+### Node.js Gateway (`PDF_QA_Bot/.env`)
+
+```env
+# REQUIRED: Must match SECRET_KEY used by the RAG service
+JWT_SECRET=your-super-secret-jwt-key-change-this-in-production
+
+# REQUIRED: Session secret for express-session
+SESSION_SECRET=your-session-secret-change-this-in-production
+
+# Optional
+PORT=4000
+RAG_SERVICE_URL=http://localhost:5000
+```
+
+### RAG Service (`PDF_QA_Bot/rag-service/.env`)
 
 ```env
 # Optional model override
 HF_GENERATION_MODEL=google/flan-t5-base
 
-# REQUIRED: Authentication Configuration
+# REQUIRED: JWT signing secret — must match JWT_SECRET in Node gateway
 SECRET_KEY=your-super-secret-jwt-key-change-this-in-production
 ACCESS_TOKEN_EXPIRE_MINUTES=30
 
-# Optional: Database Configuration (defaults to SQLite)
+# Optional: Database (defaults to SQLite)
 DATABASE_URL=sqlite:///./pdf_qa_bot.db
 # For PostgreSQL: DATABASE_URL=postgresql://user:password@localhost/dbname
-# For MySQL: DATABASE_URL=mysql://user:password@localhost/dbname
 ```
 
 🔐 **Security Configuration Notes:**
 
-- **`SECRET_KEY`**: MUST be changed in production! Generate with:
+- **`JWT_SECRET` / `SECRET_KEY`**: These must be the **same value** — the Node.js gateway verifies tokens that the FastAPI service issues. Generate a secure key with:
   ```bash
   python -c "from secrets import token_urlsafe; print(token_urlsafe(32))"
   ```
 - **`DATABASE_URL`**: Defaults to SQLite for development. Use PostgreSQL/MySQL for production.
-- Keep real secrets out of git.
+- Keep all secrets out of git. Use `.env` files or a secrets manager.
 
 ## Authentication
 
@@ -256,14 +271,6 @@ CREATE TABLE users (
 - Add API rate limiting
 - Monitor authentication logs
 - Regular security audits
-  HF_GENERATION_MODEL=google/flan-t5-base
-
-````
-
-Notes:
-
-- `OPENAI_API_KEY` is not required for current Hugging Face RAG flow.
-- Keep real secrets out of git.
 
 ## 3) Run the App (3 terminals)
 
@@ -276,10 +283,13 @@ uvicorn main:app --host 0.0.0.0 --port 5000 --reload
 
 ### Terminal B — Node backend (port 4000)
 
+> 🔐 The gateway now validates JWT tokens on `/upload`, `/ask`, `/summarize`, and `/compare`. Clients must obtain a token via `POST /auth/login` and send it as `Authorization: Bearer <token>`.
+
 ```bash
-# from the repository root (where server.js lives)
-cd <your-repo-directory>
+# from the PDF_QA_Bot directory
+cd PDF_QA_Bot
 node server.js
+# or: npm start
 ```
 
 ### Terminal C — Frontend (port 3000)
