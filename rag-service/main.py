@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, File, UploadFile
+from fastapi import FastAPI, Request, File, UploadFile, Depends, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from langchain_community.document_loaders import PyPDFLoader
@@ -18,15 +18,17 @@ import uuid
 import torch
 import uvicorn
 
-# IMPORTANT: Authentication REMOVED as per issue requirement
-# (Authentication was breaking existing endpoints)
+# Authentication — required to prevent cross-user data leakage
+from auth.middleware import AuthMiddleware
+from auth.models import User, UserRole
+from auth.router import router as auth_router
 
 load_dotenv()
 
 app = FastAPI(
     title="PDF QA Bot API",
-    description="PDF Question-Answering Bot (Session-based, No Auth)",
-    version="2.1.0"
+    description="PDF Question-Answering Bot with session-ownership enforcement",
+    version="2.2.0"
 )
 
 # CORS
@@ -43,10 +45,14 @@ limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# Auth routes
+app.include_router(auth_router, prefix="/auth", tags=["auth"])
+
 # ===============================
-# SESSION STORAGE (REQUIRED: keep sessionId)
+# SESSION STORAGE
 # ===============================
-# Format: { session_id: { "vectorstores": [FAISS], "last_accessed": float } }
+# Format: { session_id: { "vectorstores": [FAISS], "last_accessed": float, "user_id": int } }
+# user_id is set on upload and checked on every read — prevents cross-user leakage.
 sessions = {}
 SESSION_TIMEOUT = 3600  # 1 hour
 
@@ -142,7 +148,11 @@ def readiness_check():
 # ===============================
 @app.post("/upload")
 @limiter.limit("10/15 minutes")
-async def upload_file(request: Request, file: UploadFile = File(...)):
+async def upload_file(
+    request: Request,
+    file: UploadFile = File(...),
+    current_user: User = Depends(AuthMiddleware.get_current_user)
+):
     if not file.filename.lower().endswith(".pdf"):
         return {"error": "Only PDF files are supported"}
 
@@ -168,7 +178,8 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
 
         sessions[session_id] = {
             "vectorstores": [vectorstore],
-            "last_accessed": time.time()
+            "last_accessed": time.time(),
+            "user_id": current_user.id  # FIX: bind session to uploader
         }
 
         return {
@@ -185,7 +196,11 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
 # ===============================
 @app.post("/ask")
 @limiter.limit("60/15 minutes")
-def ask_question(request: Request, data: AskRequest):
+def ask_question(
+    request: Request,
+    data: AskRequest,
+    current_user: User = Depends(AuthMiddleware.get_current_user)
+):
     cleanup_expired_sessions()
 
     if not data.session_ids:
@@ -195,6 +210,12 @@ def ask_question(request: Request, data: AskRequest):
     for sid in data.session_ids:
         session = sessions.get(sid)
         if session:
+            # FIX: enforce ownership — only allow access to own sessions
+            if session["user_id"] != current_user.id and current_user.role != UserRole.ADMIN:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Access denied: session '{sid}' belongs to another user."
+                )
             session["last_accessed"] = time.time()
             vectorstores.extend(session["vectorstores"])
 
@@ -225,7 +246,11 @@ def ask_question(request: Request, data: AskRequest):
 # ===============================
 @app.post("/summarize")
 @limiter.limit("15/15 minutes")
-def summarize_pdf(request: Request, data: SummarizeRequest):
+def summarize_pdf(
+    request: Request,
+    data: SummarizeRequest,
+    current_user: User = Depends(AuthMiddleware.get_current_user)
+):
     cleanup_expired_sessions()
 
     if not data.session_ids:
@@ -235,6 +260,12 @@ def summarize_pdf(request: Request, data: SummarizeRequest):
     for sid in data.session_ids:
         session = sessions.get(sid)
         if session:
+            # FIX: enforce ownership
+            if session["user_id"] != current_user.id and current_user.role != UserRole.ADMIN:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Access denied: session '{sid}' belongs to another user."
+                )
             vectorstores.extend(session["vectorstores"])
 
     if not vectorstores:
@@ -257,7 +288,11 @@ def summarize_pdf(request: Request, data: SummarizeRequest):
 # ===============================
 @app.post("/compare")
 @limiter.limit("10/15 minutes")
-def compare_documents(request: Request, data: CompareRequest):
+def compare_documents(
+    request: Request,
+    data: CompareRequest,
+    current_user: User = Depends(AuthMiddleware.get_current_user)
+):
     cleanup_expired_sessions()
 
     if len(data.session_ids) < 2:
@@ -267,6 +302,12 @@ def compare_documents(request: Request, data: CompareRequest):
     for sid in data.session_ids:
         session = sessions.get(sid)
         if session:
+            # FIX: enforce ownership
+            if session["user_id"] != current_user.id and current_user.role != UserRole.ADMIN:
+                raise HTTPException(
+                    status_code=status.HTTP_403_FORBIDDEN,
+                    detail=f"Access denied: session '{sid}' belongs to another user."
+                )
             vs = session["vectorstores"][0]
             chunks = vs.similarity_search("main topics", k=4)
             text = "\n".join([c.page_content for c in chunks])
