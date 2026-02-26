@@ -12,6 +12,26 @@ function App() {
   const [uploading, setUploading] = useState(false);
   const [asking, setAsking] = useState(false);
 
+  const handleFileChange = (event) => {
+    const selectedFile = event.target.files && event.target.files[0];
+    if (!selectedFile) {
+      setFile(null);
+      return;
+    }
+
+    const isPdfExt = selectedFile.name.toLowerCase().endsWith(".pdf");
+    const isPdfMime = selectedFile.type === "application/pdf";
+
+    if (!isPdfExt || !isPdfMime) {
+      alert("Only PDF files are supported.");
+      event.target.value = "";
+      setFile(null);
+      return;
+    }
+
+    setFile(selectedFile);
+  };
+
   const uploadPDF = async () => {
     if (!file) return;
     setUploading(true);
@@ -67,7 +87,12 @@ function App() {
             disabled={uploading}
           >
             Upload PDF
-            <input type="file" hidden onChange={(e) => setFile(e.target.files[0])} />
+            <input
+              type="file"
+              hidden
+              accept=".pdf,application/pdf"
+              onChange={handleFileChange}
+            />
           </Button>
           <Button variant="outlined" onClick={uploadPDF} disabled={!file || uploading}>
             {uploading ? <CircularProgress size={24} /> : "Submit"}

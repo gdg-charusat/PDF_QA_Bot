@@ -1,310 +1,260 @@
 import React, { useState, useEffect } from "react";
 import axios from "axios";
 import ReactMarkdown from "react-markdown";
-import { Document, Page, pdfjs } from "react-pdf";
 import "bootstrap/dist/css/bootstrap.min.css";
 import {
   Container,
+  Row,
+  Col,
   Button,
   Form,
   Card,
   Spinner,
-  Navbar,
-  Row,
-  Col,
+  Navbar
 } from "react-bootstrap";
-
-pdfjs.GlobalWorkerOptions.workerSrc = new URL(
-  "pdfjs-dist/build/pdf.worker.min.mjs",
-  import.meta.url
-).toString();
 
 const API_BASE = process.env.REACT_APP_API_URL || "";
 const THEME_STORAGE_KEY = "pdf-qa-bot-theme";
 
 function App() {
-  // -------------------------------
-  // Core state
-  // -------------------------------
   const [file, setFile] = useState(null);
-  const [pdfs, setPdfs] = useState([]); // { name, doc_id, url }
-  const [selectedDocs, setSelectedDocs] = useState([]);
-  const [question, setQuestion] = useState("");
+
+  // Keep sessionId support (REQUIRED by reviewer)
+  const [pdfs, setPdfs] = useState([]); // {name, url, session_id}
+  const [selectedSessions, setSelectedSessions] = useState([]);
   const [chatHistory, setChatHistory] = useState([]);
   const [comparisonResult, setComparisonResult] = useState(null);
+  const [question, setQuestion] = useState("");
 
-  // -------------------------------
-  // UI state
-  // -------------------------------
   const [uploading, setUploading] = useState(false);
   const [asking, setAsking] = useState(false);
+  const [processingPdf, setProcessingPdf] = useState(false);
   const [summarizing, setSummarizing] = useState(false);
   const [comparing, setComparing] = useState(false);
 
-  // -------------------------------
-  // Theme persistence
-  // -------------------------------
   const [darkMode, setDarkMode] = useState(() => {
-    const saved = localStorage.getItem(THEME_STORAGE_KEY);
-    return saved ? JSON.parse(saved) : false;
+    const savedTheme = localStorage.getItem(THEME_STORAGE_KEY);
+    return savedTheme ? JSON.parse(savedTheme) : false;
   });
 
-  // -------------------------------
-  // Session isolation
-  // -------------------------------
-  const [sessionId, setSessionId] = useState("");
-
-  useEffect(() => {
-    setSessionId(
-      crypto.randomUUID
-        ? crypto.randomUUID()
-        : Math.random().toString(36).substring(2, 15)
-    );
-  }, []);
-
+  // Theme persistence
   useEffect(() => {
     localStorage.setItem(THEME_STORAGE_KEY, JSON.stringify(darkMode));
     document.body.classList.toggle("dark-mode", darkMode);
   }, [darkMode]);
 
-  // ===============================
-  // Upload
-  // ===============================
-  const uploadDocument = async () => {
-    if (!file) return;
+  // Load saved data
+  useEffect(() => {
+    const savedChat = localStorage.getItem("chatHistory");
+    const savedPdfs = localStorage.getItem("pdfs");
 
+    if (savedChat) {
+      try {
+        setChatHistory(JSON.parse(savedChat));
+      } catch {}
+    }
+
+    if (savedPdfs) {
+      try {
+        setPdfs(JSON.parse(savedPdfs));
+      } catch {}
+    }
+  }, []);
+
+  // Persist data
+  useEffect(() => {
+    localStorage.setItem("chatHistory", JSON.stringify(chatHistory));
+  }, [chatHistory]);
+
+  useEffect(() => {
+    localStorage.setItem("pdfs", JSON.stringify(pdfs));
+  }, [pdfs]);
+
+  const clearHistory = () => {
+    if (window.confirm("Clear all history and uploads?")) {
+      setChatHistory([]);
+      setPdfs([]);
+      setSelectedSessions([]);
+      localStorage.removeItem("chatHistory");
+      localStorage.removeItem("pdfs");
+    }
+  };
+
+  // Upload PDF (keeps session_id — CRITICAL)
+  const uploadPDF = async () => {
+    if (!file) return;
     setUploading(true);
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 90_000);
+    setProcessingPdf(true);
+
+    const formData = new FormData();
+    formData.append("file", file);
 
     try {
-      const formData = new FormData();
-      formData.append("file", file);
-      formData.append("sessionId", sessionId);
-
-      const res = await axios.post(`${API_BASE}/upload`, formData, {
-        signal: controller.signal,
-      });
-
+      const res = await axios.post(`${API_BASE}/upload`, formData);
       const url = URL.createObjectURL(file);
-      const dotIndex = file.name.lastIndexOf(".");
-      const ext =
-        dotIndex !== -1 && dotIndex < file.name.length - 1
-          ? file.name.substring(dotIndex + 1).toLowerCase()
-          : "";
 
       setPdfs((prev) => [
         ...prev,
-        { name: file.name, doc_id: res.data?.doc_id, url, ext },
+        {
+          name: file.name,
+          url,
+          session_id: res.data.session_id, // REQUIRED: keep sessionId
+        },
       ]);
 
       setFile(null);
-      alert("Document uploaded!");
+      alert("PDF uploaded successfully!");
     } catch (e) {
-      if (e.name === "AbortError" || e.code === "ECONNABORTED") {
-        alert("Upload timed out. Try a smaller document.");
-      } else {
-        alert("Upload failed.");
-      }
-    } finally {
-      clearTimeout(timeoutId);
-      setUploading(false);
+      alert(e.response?.data?.error || "Upload failed.");
     }
+
+    setUploading(false);
+    setProcessingPdf(false);
   };
 
-  // -------------------------------
-  // Toggle document selection
-  // -------------------------------
-  const toggleDocSelection = (docId) => {
+  const toggleDocSelection = (session_id) => {
     setComparisonResult(null);
-    setSelectedDocs((prev) =>
-      prev.includes(docId)
-        ? prev.filter((id) => id !== docId)
-        : [...prev, docId]
+    setSelectedSessions((prev) =>
+      prev.includes(session_id)
+        ? prev.filter((id) => id !== session_id)
+        : [...prev, session_id]
     );
   };
 
-  // -------------------------------
-  // Ask question (with timeout)
-  // -------------------------------
+  // Ask using session_ids (NOT doc_ids)
   const askQuestion = async () => {
-    if (!question.trim() || selectedDocs.length === 0) return;
-    if (question.length > 2000) {
-      alert("Question too long (max 2000 characters)");
-      return;
-    }
+    if (!question.trim() || selectedSessions.length === 0) return;
 
-    setAsking(true);
     setChatHistory((prev) => [...prev, { role: "user", text: question }]);
+    const q = question;
     setQuestion("");
-
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 60_000);
+    setAsking(true);
 
     try {
-      const res = await axios.post(
-        `${API_BASE}/ask`,
-        {
-          question,
-          sessionId,
-          doc_ids: selectedDocs,
-        },
-        { signal: controller.signal }
-      );
+      const res = await axios.post(`${API_BASE}/ask`, {
+        question: q,
+        session_ids: selectedSessions,
+      });
 
       setChatHistory((prev) => [
         ...prev,
-        { role: "bot", text: res.data.answer, confidence: res.data.confidence_score },
+        { role: "bot", text: res.data.answer },
       ]);
-    } catch (e) {
-      const msg =
-        e.name === "AbortError" || e.code === "ECONNABORTED"
-          ? "Request timed out."
-          : "Error getting answer.";
-      setChatHistory((prev) => [...prev, { role: "bot", text: msg }]);
-    } finally {
-      clearTimeout(timeoutId);
-      setAsking(false);
+    } catch {
+      setChatHistory((prev) => [
+        ...prev,
+        { role: "bot", text: "Error getting answer." },
+      ]);
     }
+
+    setAsking(false);
   };
 
-  // -------------------------------
-  // Summarize PDFs
-  // -------------------------------
   const summarizePDF = async () => {
-    if (selectedDocs.length === 0) return;
-
+    if (selectedSessions.length === 0) return;
     setSummarizing(true);
+
     try {
       const res = await axios.post(`${API_BASE}/summarize`, {
-        sessionId,
-        doc_ids: selectedDocs,
+        session_ids: selectedSessions,
       });
+
       setChatHistory((prev) => [
         ...prev,
         { role: "bot", text: res.data.summary },
       ]);
     } catch {
       alert("Error summarizing.");
-    } finally {
-      setSummarizing(false);
     }
+
+    setSummarizing(false);
   };
 
-  // Export chat
-  const exportChat = (type) => {
-    if (!selectedPdf) return;
-    const chat = pdfs.find(pdf => pdf.name === selectedPdf)?.chat || [];
-    if (type === "csv") {
-      const csv = Papa.unparse(chat);
-      const blob = new Blob([csv], { type: "text/csv" });
-      saveAs(blob, `${selectedPdf}-chat.csv`);
-    } else if (type === "pdf") {
-      // Export chat as plain text (real PDF would require jsPDF/pdf-lib)
-      const text = chat.map(msg => `${msg.role}: ${msg.text}`).join("\n\n");
-      const blob = new Blob([text], { type: "text/plain" });
-      saveAs(blob, `${selectedPdf}-chat.txt`);
+  const compareDocuments = async () => {
+    if (selectedSessions.length < 2) return;
+    setComparing(true);
+
+    try {
+      const res = await axios.post(`${API_BASE}/compare`, {
+        session_ids: selectedSessions,
+      });
+      setComparisonResult(res.data.comparison);
+    } catch {
+      alert("Error comparing documents.");
     }
+
+    setComparing(false);
   };
 
-  // -------------------------------
-  // Helpers
-  // -------------------------------
-  const selectedPdfs = pdfs.filter((p) => selectedDocs.includes(p.doc_id));
+  const selectedPdfs = pdfs.filter((p) =>
+    selectedSessions.includes(p.session_id)
+  );
+
   const pageBg = darkMode ? "bg-dark text-light" : "bg-light text-dark";
   const cardClass = darkMode
     ? "text-white border-secondary shadow"
     : "bg-white text-dark border-0 shadow-sm";
-  const inputClass = darkMode ? "text-white border-secondary" : "";
 
-  // -------------------------------
-  // Render
-  // -------------------------------
   return (
     <div className={pageBg} style={{ minHeight: "100vh" }}>
-      <Navbar bg={darkMode ? "dark" : "primary"} variant="dark">
+      <Navbar bg={darkMode ? "dark" : "primary"} variant="dark" className="mb-4">
         <Container className="d-flex justify-content-between">
-          <Navbar.Brand>🤖 PDF Q&A Bot</Navbar.Brand>
-          <Button variant="outline-light" onClick={() => setDarkMode(!darkMode)}>
-            {darkMode ? "Light" : "Dark"}
-          </Button>
+          <Navbar.Brand>PDF Q&A Bot</Navbar.Brand>
+          <div className="d-flex gap-2">
+            <Button variant="danger" size="sm" onClick={clearHistory}>
+              Clear History
+            </Button>
+            <Button
+              variant="outline-light"
+              onClick={() => setDarkMode(!darkMode)}
+            >
+              {darkMode ? "Light" : "Dark"}
+            </Button>
+          </div>
         </Container>
       </Navbar>
 
-      <Container className="mt-4">
-        {/* Upload */}
+      <Container>
         <Card className={`mb-4 ${cardClass}`}>
           <Card.Body>
+            <h5>Upload PDF</h5>
             <Form>
               <Form.Control
                 type="file"
-                className={inputClass}
-                accept=".pdf,.docx,.txt,.md"
                 onChange={(e) => setFile(e.target.files[0])}
               />
               <Button
                 className="mt-2"
-                onClick={uploadDocument}
-                disabled={!file || uploading}
+                onClick={uploadPDF}
+                disabled={!file || uploading || processingPdf}
               >
-                {uploading ? (
-                  <Spinner size="sm" animation="border" />
-                ) : (
-                  "Upload Document"
-                )}
+                {uploading ? <Spinner size="sm" animation="border" /> : "Upload"}
               </Button>
             </Form>
           </Card.Body>
         </Card>
 
-        {/* Document selection */}
         {pdfs.length > 0 && (
           <Card className={`mb-4 ${cardClass}`}>
             <Card.Body>
               <h5>Select Documents</h5>
               {pdfs.map((pdf) => (
                 <Form.Check
-                  key={pdf.doc_id}
+                  key={pdf.session_id}
                   type="checkbox"
                   label={pdf.name}
-                  checked={selectedDocs.includes(pdf.doc_id)}
-                  onChange={() => toggleDocSelection(pdf.doc_id)}
+                  checked={selectedSessions.includes(pdf.session_id)}
+                  onChange={() => toggleDocSelection(pdf.session_id)}
                 />
               ))}
             </Card.Body>
           </Card>
         )}
-        {/* Side-by-side comparison when 2 docs selected */}
-        {selectedPdfs.length === 2 && (
-          <>
-            <Card className={`mb-4 ${cardClass}`}>
-              <Card.Body>
-                <Button
-                  variant="info"
-                  onClick={compareDocuments}
-                  disabled={comparing}
-                >
-                  {comparing ? (
-                    <Spinner size="sm" animation="border" />
-                  ) : (
-                    "Generate Comparison"
-                  )}
-                </Button>
 
-                {comparisonResult && (
-                  <div className="mt-4">
-                    <h5>AI Comparison</h5>
-                    <ReactMarkdown>{comparisonResult}</ReactMarkdown>
-                  </div>
-                )}
-              </Card.Body>
-            </Card>
-          </>
-        )}
-
-        {/* Chat */}
         <Card className={cardClass}>
           <Card.Body>
+            <h5>Ask Across Selected Documents</h5>
+
             <div style={{ maxHeight: 300, overflowY: "auto", marginBottom: 16 }}>
               {chatHistory.map((msg, i) => (
                 <div key={i} className="mb-2">
@@ -314,84 +264,60 @@ function App() {
               ))}
             </div>
 
-        {/* Chat Mode */}
-        {selectedPdfs.length !== 2 && (
-          <Card className={cardClass}>
-            <Card.Body>
-              <h5>Ask Across Selected Documents</h5>
-              <div
-                style={{ maxHeight: 300, overflowY: "auto", marginBottom: 16 }}
-              >
-                {chatHistory.map((msg, i) => (
-                  <div key={i} className="mb-2">
-                    <strong>{msg.role === "user" ? "You" : "Bot"}:</strong>
-                    {msg.role === "bot" && msg.confidence !== undefined && (
-                      <span
-                        className="badge ms-2"
-                        style={{
-                          backgroundColor:
-                            msg.confidence >= 70 ? "#28a745"
-                              : msg.confidence >= 40 ? "#ffc107"
-                                : "#dc3545",
-                          color: msg.confidence >= 40 && msg.confidence < 70 ? "#856404" : "#fff",
-                          fontSize: "0.7rem"
-                        }}
-                      >
-                        Confidence: {msg.confidence}%
-                      </span>
-                    )}
-                    <ReactMarkdown>{msg.text}</ReactMarkdown>
-                  </div>
-                ))}
+            <Form
+              className="d-flex gap-2 mb-3"
+              onSubmit={(e) => e.preventDefault()}
+            >
+              <Form.Control
+                type="text"
+                placeholder="Ask a question..."
+                value={question}
+                onChange={(e) => setQuestion(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter") {
+                    e.preventDefault();
+                    askQuestion();
+                  }
+                }}
+              />
+              <Button variant="success" onClick={askQuestion} disabled={asking}>
+                {asking ? <Spinner size="sm" animation="border" /> : "Ask"}
+              </Button>
+            </Form>
+
+            <Button
+              variant="warning"
+              className="me-2"
+              onClick={summarizePDF}
+              disabled={summarizing}
+            >
+              {summarizing ? (
+                <Spinner size="sm" animation="border" />
+              ) : (
+                "Summarize"
+              )}
+            </Button>
+
+            <Button
+              variant="info"
+              onClick={compareDocuments}
+              disabled={selectedSessions.length < 2}
+            >
+              {comparing ? (
+                <Spinner size="sm" animation="border" />
+              ) : (
+                "Compare Selected"
+              )}
+            </Button>
+
+            {comparisonResult && (
+              <div className="mt-4">
+                <h5>AI Comparison</h5>
+                <ReactMarkdown>{comparisonResult}</ReactMarkdown>
               </div>
-
-              <Form
-                className="d-flex gap-2 mb-3"
-                onSubmit={(e) => e.preventDefault()}
-              >
-                <Form.Control
-                  type="text"
-                  placeholder="Ask a question..."
-                  className={inputClass}
-                  value={question}
-                  onChange={(e) => setQuestion(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      e.preventDefault();
-                      askQuestion();
-                    }
-                  }}
-                />
-                <Button
-                  variant="success"
-                  onClick={askQuestion}
-                  disabled={asking}
-                >
-                  {asking ? <Spinner size="sm" animation="border" /> : "Ask"}
-                </Button>
-              </Form>
-
-              <div className="mt-3">
-                <Button
-                  variant="warning"
-                  className="me-2"
-                  onClick={summarizePDF}
-                  disabled={summarizing}
-                >
-                  {summarizing ? <Spinner size="sm" /> : "Summarize"}
-                </Button>
-
-                <Button
-                  variant="info"
-                  onClick={compareDocuments}
-                  disabled={selectedDocs.length < 2 || comparing}
-                >
-                  {comparing ? <Spinner size="sm" /> : "Compare"}
-                </Button>
-              </div>
-            </Card.Body>
-          </Card>
-        )}
+            )}
+          </Card.Body>
+        </Card>
       </Container>
     </div>
   );

@@ -1,0 +1,61 @@
+version: '3.8'
+
+services:
+  rag-service:
+    build:
+      context: ./rag-service
+      dockerfile: Dockerfile
+    ports:
+      - '5000:5000'
+    environment:
+      - SECRET_KEY=your-super-secret-jwt-key-here-change-in-production
+      - ACCESS_TOKEN_EXPIRE_MINUTES=30
+      - DATABASE_URL=sqlite:///./pdf_qa_bot.db
+      - HF_GENERATION_MODEL=google/flan-t5-small
+    volumes:
+      - ./uploads:/app/uploads
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:5000/healthz']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+
+  gateway:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - '4000:4000'
+    environment:
+      - RAG_SERVICE_URL=http://rag-service:5000
+      - PORT=4000
+    volumes:
+      - ./uploads:/app/uploads
+    depends_on:
+      rag-service:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'curl', '-f', 'http://localhost:4000/healthz']
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    ports:
+      - '3000:3000'
+    depends_on:
+      gateway:
+        condition: service_healthy
+    environment:
+      - REACT_APP_API_URL=http://localhost:4000
+    restart: unless-stopped
+
+volumes:
+  uploads:
