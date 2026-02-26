@@ -12,6 +12,21 @@ from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from uuid import uuid4
+
+# Create FastAPI app
+app = FastAPI()
+
+# Custom key function for Limiter
+def real_ip_key_func(request: Request):
+    x_real_ip = request.headers.get("X-Real-IP")
+    if x_real_ip and isinstance(x_real_ip, str) and x_real_ip.count('.') == 3:
+        return x_real_ip
+    return request.client.host
+
+# Limiter instance with custom key function
+limiter = Limiter(key_func=real_ip_key_func)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 @app.post("/upload")
 @limiter.limit("10/15 minutes")
 async def upload_file(request: Request, file: UploadFile = File(...)):
