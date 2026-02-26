@@ -50,118 +50,42 @@ app.use(
   })
 );
 
-// ------------------------------------------------------------------
-// AXIOS RETRY CONFIG
-// ------------------------------------------------------------------
-axiosRetry(axios, {
-  retries: MAX_RETRY_ATTEMPTS,
-  retryDelay: axiosRetry.exponentialDelay,
-  retryCondition: (error) =>
-    axiosRetry.isNetworkOrIdempotentRequestError(error) ||
-    error.code === "ECONNABORTED" ||
-    (error.response && error.response.status >= 500),
-});
+// ---------------------------------------------------------------------------
+// Rate limiters
+// ---------------------------------------------------------------------------
+const makeLimiter = (max, msg) =>
+  rateLimit({
+    windowMs: 15 * 60 * 1000,
+    max,
+    message: msg,
+    standardHeaders: true,
+    legacyHeaders: false,
+    validate: { xForwardedForHeader: false },
+  });
 
-// ------------------------------------------------------------------
-// RATE LIMITERS
-// ------------------------------------------------------------------
-const uploadLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 5,
-});
-
-const askLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 30,
-});
-
-const summarizeLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 10,
-});
-
-const compareLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000,
-  max: 10,
-});
+const uploadLimiter = makeLimiter(5, "Too many PDF uploads, please try again after 15 minutes.");
+const askLimiter = makeLimiter(30, "Too many questions, please try again after 15 minutes.");
+const summarizeLimiter = makeLimiter(10, "Too many summarization requests, please try again after 15 minutes.");
+const compareLimiter = makeLimiter(10, "Too many comparison requests, please try again after 15 minutes.");
 
 // ------------------------------------------------------------------
 // FILE STORAGE
 // ------------------------------------------------------------------
 const UPLOAD_DIR = path.resolve(__dirname, "uploads");
 
-if (!fs.existsSync(UPLOAD_DIR)) {
-  fs.mkdirSync(UPLOAD_DIR);
-}
+// RAG service base URL (Python FastAPI)
+const RAG_URL = "http://localhost:5000";
 
-// ------------------------------------------------------------------
-// MULTER CONFIG
-// ------------------------------------------------------------------
+// Common timeout for all RAG calls (3 minutes)
+const RAG_TIMEOUT = 180_000;
 
-const SUPPORTED_EXTENSIONS = [".pdf", ".docx", ".txt", ".md"];
-const PDF_MIME_TYPE = "application/pdf";
-const PDF_MAGIC = "%PDF"
-
-const storage = multer.diskStorage({
-  destination: "uploads/",
-  filename: (req, file, cb) => {
-    const ext = path.extname(file.originalname).toLowerCase();
-    const uniqueName = `${Date.now()}-${Math.round(
-      Math.random() * 1e9
-    )}${ext}`;
-    cb(null, uniqueName);
-  },
-});
-
-const upload = multer({
-  storage,
-  limits: { fileSize: 20 * 1024 * 1024 },
-  fileFilter: (req, file, cb) => {
-    const safeName = path.basename(file.originalname);
-    const ext = path.extname(safeName).toLowerCase();
-    if (SUPPORTED_EXTENSIONS.includes(ext) && file.mimetype === PDF_MIME_TYPE) {
-      cb(null, true);
-    } else {
-      cb(new Error("Only PDF files are supported."));
-    }
-  },
-});
-
-
-const uploadSingle = (req, res, next) => {
-  upload.single("file")(req, res, (err) => {
-    if (!err) {
-      return next();
-    }
-
-    if (err instanceof multer.MulterError) {
-      return res.status(400).json({ error: err.message });
-    }
-
-    return res.status(400).json({ error: err.message || "Invalid upload." });
-  });
-};
-
-const hasPdfMagicNumber = async (filePath) => {
-  const handle = await fs.promises.open(filePath, "r");
-  try {
-    const buffer = Buffer.alloc(4);
-    const { bytesRead } = await handle.read(buffer, 0, 4, 0);
-    return bytesRead === 4 && buffer.toString("ascii") === PDF_MAGIC;
-  } finally {
-    await handle.close();
-  }
-}
-
-// ------------------------------------------------------------------
-// ROUTE: UPLOAD
-// ------------------------------------------------------------------
-app.post("/upload", uploadLimiter, uploadSingle, async (req, res) => {
+// ---------------------------------------------------------------------------
+// POST /upload  — upload a PDF and get back a doc_id
+// ---------------------------------------------------------------------------
+app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
   try {
     if (!req.file) {
-      return res.status(400).json({
-        error: "No file uploaded. Use form field name 'file'.",
-      });
+      return res.status(400).json({ error: "No file uploaded. Use form field name 'file'." });
     }
 
     const { sessionId } = req.body;
@@ -184,163 +108,115 @@ app.post("/upload", uploadLimiter, uploadSingle, async (req, res) => {
       // Continue with PDF upload even if reset fails
     }
 
-    // Send PDF to Python service for processing
-    const uploadResponse = await axios.post("http://localhost:5000/process-pdf", {
-      filePath: filePath,
-    });
+    const response = await axios.post(
+      `${RAG_URL}/process-pdf`,
+      { filePath, session_id: sessionId },
+      { timeout: RAG_TIMEOUT }
+    );
 
-    // Store the new PDF session ID for future validation
-    if (uploadResponse.data.session_id && req.session) {
-      req.session.currentPdfSessionId = uploadResponse.data.session_id;
-    }
-
-    res.json({
-      message: "PDF uploaded & processed successfully!",
-      session_id: uploadResponse.data.session_id,
-      details: uploadResponse.data
+    // Forward the doc_id that Python assigned to this PDF
+    return res.json({
+      message: response.data.message || "PDF processed successfully",
+      doc_id: response.data.doc_id,
     });
   } catch (err) {
-    console.error("Upload failed:", err.message);
-    res.status(500).json({ error: "Upload failed" });
+    console.error("[/upload]", err.response?.data || err.message);
+    return res.status(500).json({ error: "Upload failed. Please try again." });
   }
 });
 
-// ------------------------------------------------------------------
-// ROUTE: ASK
-// ------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// POST /ask  — ask a question across one or more selected documents
+// ---------------------------------------------------------------------------
 app.post("/ask", askLimiter, async (req, res) => {
-  const { question, sessionId } = req.body;
+  const { question, sessionId, doc_ids } = req.body;
 
-  if (!sessionId)
-    return res.status(400).json({ error: "Missing sessionId." });
-
-  if (!question || typeof question !== "string" || !question.trim())
-    return res.status(400).json({ error: "Invalid question." });
+  if (!sessionId) return res.status(400).json({ error: "Missing sessionId." });
+  if (!question || !question.trim()) return res.status(400).json({ error: "Missing question." });
 
   try {
-    if (!req.session.chatHistory) {
-      req.session.chatHistory = [];
-    }
+    if (!req.session.chatHistory) req.session.chatHistory = [];
 
-    req.session.chatHistory.push({
-      role: "user",
-      content: question.trim(),
-    });
+    req.session.chatHistory.push({ role: "user", content: question });
 
     const response = await axios.post(
-      "http://localhost:5000/ask",
+      `${RAG_URL}/ask`,
       {
-        question: question.trim(),
+        question,
         session_id: sessionId,
-        history: req.session.chatHistory,
+        doc_ids: Array.isArray(doc_ids) ? doc_ids : [],
+        history: req.session.chatHistory.slice(-10), // last 10 turns
       },
-      { timeout: API_REQUEST_TIMEOUT }
+      { timeout: RAG_TIMEOUT }
     );
 
-    req.session.chatHistory.push({
-      role: "assistant",
-      content: response.data.answer,
-    });
+    req.session.chatHistory.push({ role: "assistant", content: response.data.answer });
 
-    res.json(response.data);
+    return res.json(response.data);
   } catch (error) {
-    console.error("Ask failed:", error.message);
-    res.status(500).json({ error: "Error asking question" });
+    console.error("[/ask]", error.response?.data || error.message);
+    return res.status(500).json({ error: "Error getting answer. Please try again." });
   }
 });
 
-// ------------------------------------------------------------------
-// ROUTE: CLEAR HISTORY
-// ------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// POST /clear-history  — wipe this user's chat history
+// ---------------------------------------------------------------------------
 app.post("/clear-history", (req, res) => {
-  if (req.session) {
-    req.session.chatHistory = [];
-    req.session.currentPdfSessionId = null;
-  }
-  res.json({ message: "Chat history cleared" });
+  if (req.session) req.session.chatHistory = [];
+  res.json({ message: "History cleared" });
 });
 
-app.get("/pdf-status", async (req, res) => {
-  try {
-    // Check backend PDF status
-    const statusResponse = await axios.get("http://localhost:5000/status");
-    
-    // Include frontend session status
-    const frontendStatus = {
-      hasSession: !!req.session,
-      hasHistory: req.session?.chatHistory?.length > 0 || false,
-      historyLength: req.session?.chatHistory?.length || 0,
-      currentSessionId: req.session?.currentPdfSessionId || null
-    };
-
-    res.json({
-      backend: statusResponse.data,
-      frontend: frontendStatus
-    });
-  } catch (err) {
-    console.error("Error fetching PDF status:", err.message);
-    res.status(500).json({ error: "Could not fetch PDF status" });
-  }
-});
-
-// ------------------------------------------------------------------
-// ROUTE: SUMMARIZE
-// ------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// POST /summarize  — summarize one or more selected documents
+// ---------------------------------------------------------------------------
 app.post("/summarize", summarizeLimiter, async (req, res) => {
-  const { sessionId } = req.body;
-
-  if (!sessionId)
-    return res.status(400).json({ error: "Missing sessionId." });
+  const { sessionId, doc_ids } = req.body || {};
+  if (!sessionId) return res.status(400).json({ error: "Missing sessionId." });
 
   try {
     const response = await axios.post(
-      "http://localhost:5000/summarize",
-      { session_id: sessionId },
-      { timeout: API_REQUEST_TIMEOUT }
+      `${RAG_URL}/summarize`,
+      {
+        session_id: sessionId,
+        doc_ids: Array.isArray(doc_ids) ? doc_ids : [],
+      },
+      { timeout: RAG_TIMEOUT }
     );
-
-    res.json({ summary: response.data.summary });
+    return res.json({ summary: response.data.summary });
   } catch (err) {
-    if (err.code === "ECONNABORTED") {
-      return res.status(504).json({ error: "Summarization timed out" });
-    }
-    res.status(500).json({ error: "Error summarizing" });
+    console.error("[/summarize]", err.response?.data || err.message);
+    return res.status(500).json({ error: "Error summarizing PDF. Please try again." });
   }
 });
 
-// ------------------------------------------------------------------
-// ROUTE: COMPARE
-// ------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// POST /compare  — compare two or more selected documents
+// ---------------------------------------------------------------------------
 app.post("/compare", compareLimiter, async (req, res) => {
+  const { sessionId, doc_ids } = req.body || {};
+  if (!sessionId) return res.status(400).json({ error: "Missing sessionId." });
+  if (!Array.isArray(doc_ids) || doc_ids.length < 2) {
+    return res.status(400).json({ error: "Please select at least 2 documents to compare." });
+  }
+
   try {
     const response = await axios.post(
-      "http://localhost:5000/compare",
-      req.body,
-      { timeout: API_REQUEST_TIMEOUT }
+      `${RAG_URL}/compare`,
+      { session_id: sessionId, doc_ids },
+      { timeout: RAG_TIMEOUT }
     );
-
-    res.json({ comparison: response.data.comparison });
+    return res.json({ comparison: response.data.comparison });
   } catch (err) {
-    res.status(500).json({ error: "Error comparing" });
-  }
-});
-
-// ------------------------------------------------------------------
-// ERROR HANDLING
-// ------------------------------------------------------------------
-app.use((err, req, res, next) => {
-  if (err.code === "LIMIT_FILE_SIZE") {
-    return res.status(400).json({
-      error: "File too large (max 20MB).",
-    });
-  }
-  if (err.message.includes("Unsupported file type")) {
-    return res.status(400).json({ error: err.message });
+    console.error("[/compare]", err.response?.data || err.message);
+    return res.status(500).json({ error: "Error comparing documents. Please try again." });
   }
   next(err);
 });
 
-// ------------------------------------------------------------------
-app.listen(4000, () =>
-  console.log("Backend running on http://localhost:4000")
-);
+// ---------------------------------------------------------------------------
+// GET /health
+// ---------------------------------------------------------------------------
+app.get("/health", (req, res) => res.json({ status: "ok" }));
+
+app.listen(4000, () => console.log("Backend running on http://localhost:4000"));
