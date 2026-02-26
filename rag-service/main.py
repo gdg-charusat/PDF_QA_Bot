@@ -1,25 +1,20 @@
-from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel, Field, validator
+from fastapi import FastAPI, Request, File, UploadFile
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_core.documents import Document
-from langchain_core.prompts import PromptTemplate
-from groq import Groq
 from dotenv import load_dotenv
-from transformers import (
-    AutoConfig,
-    AutoTokenizer,
-    AutoModelForSeq2SeqLM,
-    AutoModelForCausalLM,
-)
-from slowapi import Limiter
+from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM
+from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from pathlib import Path
 import os 
 import re
 import uuid
+import torch
 import uvicorn
 import torch
 import time
@@ -29,23 +24,35 @@ from slowapi.util import get_remote_address
 import threading
 from datetime import datetime
 
-# Post-processing helper: strips prompt echoes / context leakage from LLM output
-# so that the API always returns only the clean, user-facing answer.
-from utils.postprocess import extract_final_answer
+# IMPORTANT: Authentication REMOVED as per issue requirement
+# (Authentication was breaking existing endpoints)
 
 load_dotenv()
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-UPLOAD_DIR = (BASE_DIR / "uploads").resolve()
+app = FastAPI(
+    title="PDF QA Bot API",
+    description="PDF Question-Answering Bot (Session-based, No Auth)",
+    version="2.1.0"
+)
 
-app = FastAPI()
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Rate Limiter
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# ---------------------------------------------------------------------------
-# SESSION MANAGEMENT
-# Format: { session_id: { "docs": { doc_id: FAISS }, "last_accessed": float } }
-# ---------------------------------------------------------------------------
+# ===============================
+# SESSION STORAGE (REQUIRED: keep sessionId)
+# ===============================
+# Format: { session_id: { "vectorstores": [FAISS], "last_accessed": float } }
 sessions = {}
 SESSION_TIMEOUT = 3600  # 1 hour
 
@@ -79,55 +86,30 @@ generation_is_encoder_decoder = None
 # Load local embedding model (unchanged — FAISS retrieval stays the same)
 embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
 
-# ---------------------------------------------------------------------------
-# STARTUP: Load generation model ONCE
-# ---------------------------------------------------------------------------
-print("[STARTUP] Loading generation model at startup...")
 config = AutoConfig.from_pretrained(HF_GENERATION_MODEL)
-generation_is_encoder_decoder = bool(getattr(config, "is_encoder_decoder", False))
-generation_tokenizer = AutoTokenizer.from_pretrained(HF_GENERATION_MODEL)
+is_encoder_decoder = bool(getattr(config, "is_encoder_decoder", False))
+tokenizer = AutoTokenizer.from_pretrained(HF_GENERATION_MODEL)
 
-if generation_is_encoder_decoder:
-    generation_model = AutoModelForSeq2SeqLM.from_pretrained(
-        HF_GENERATION_MODEL,
-        low_cpu_mem_usage=False
-    )
+if is_encoder_decoder:
+    model = AutoModelForSeq2SeqLM.from_pretrained(HF_GENERATION_MODEL)
 else:
-    generation_model = AutoModelForCausalLM.from_pretrained(
-        HF_GENERATION_MODEL,
-        low_cpu_mem_usage=False
-    )
+    model = AutoModelForCausalLM.from_pretrained(HF_GENERATION_MODEL)
 
 if torch.cuda.is_available():
-    generation_model = generation_model.to("cuda")
-    print("[GPU] Model loaded on CUDA")
-else:
-    print("[CPU] Model loaded on CPU")
+    model = model.to("cuda")
 
-generation_model.eval()
-print("[STARTUP] ✅ Model loaded successfully!")
+model.eval()
+
+# ===============================
+# REQUEST MODELS
+# ===============================
+class AskRequest(BaseModel):
+    question: str = Field(..., min_length=1)
+    session_ids: list = []
 
 
-# ---------------------------------------------------------------------------
-# SESSION MANAGEMENT UTILITIES (Thread-safe, Multi-user support)
-# ---------------------------------------------------------------------------
-
-def get_session_vectorstore(session_id: str):
-    """
-    Fixes character-level spaced text produced by PyPDFLoader on certain
-    vector-based PDFs (e.g. NPTEL / IBM Coursera certificates).
-    """
-    Safely clears a specific session's vectorstore and data.
-    """
-    with sessions_lock:
-        if session_id in sessions:
-            old_vectorstore = sessions[session_id].get("vectorstore")
-            if old_vectorstore is not None:
-                del old_vectorstore  # Allow garbage collection
-            del sessions[session_id]
-
-    pattern = r'\b(?:[A-Za-z] ){2,}[A-Za-z]\b'
-    return re.sub(pattern, fix_spaced_word, text)
+class SummarizeRequest(BaseModel):
+    session_ids: list = []
 
 
 def normalize_answer(text: str) -> str:
@@ -222,64 +204,9 @@ def load_generation_model():
     generation_tokenizer = AutoTokenizer.from_pretrained(HF_GENERATION_MODEL)
 
 
-# ---------------------------------------------------------------------------
-# MODEL GENERATION
-# ---------------------------------------------------------------------------
-
-def generate_response(prompt: str, max_new_tokens: int) -> str:
-    """Run inference with the globally loaded model (no reload per request)."""
-    global generation_tokenizer, generation_model, generation_is_encoder_decoder
-    tokenizer = generation_tokenizer
-    model = generation_model
-    is_encoder_decoder = generation_is_encoder_decoder
-    model_device = next(model.parameters()).device
-
-    encoded = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
-    encoded = {k: v.to(device) for k, v in encoded.items()}
-
-    output = model.generate(
-        **encoded,
-        max_new_tokens=max_new_tokens,
-        do_sample=False,
-        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
-    )
-
-    if is_enc:
-        return tokenizer.decode(output[0], skip_special_tokens=True)
-
-    return tokenizer.decode(
-        output[0][encoded["input_ids"].shape[1]:],
-        skip_special_tokens=True,
-    )
-
-
 # ===============================
-# REQUEST MODELS
+# UTILITIES
 # ===============================
-class DocumentPath(BaseModel):
-    filePath: str
-    session_id: str
-
-
-class AskRequest(BaseModel):
-    question: str = Field(..., min_length=1)
-    session_id: str
-    doc_ids: list = []       # optional list of doc IDs to restrict search
-    history: list = []
-
-class SummarizeRequest(BaseModel):
-    session_id: str
-    doc_ids: list = []
-
-class CompareRequest(BaseModel):
-    session_id: str
-    doc_ids: list = []       # must contain exactly 2 (or more) doc IDs
-
-
-# ---------------------------------------------------------------------------
-# HELPERS
-# ---------------------------------------------------------------------------
-
 def cleanup_expired_sessions():
     current_time = time.time()
     expired = [
@@ -290,74 +217,86 @@ def cleanup_expired_sessions():
         del sessions[sid]
 
 
-def get_session_docs(session_id: str, doc_ids: list) -> list[FAISS]:
-    """
-    Return a list of FAISS vectorstores from a session.
-    If doc_ids is provided, restrict to those; otherwise return all docs.
-    """
-    session_data = sessions.get(session_id)
-    if not session_data:
-        return []
-    all_docs = session_data.get("docs", {})
-    if doc_ids:
-        return [all_docs[d] for d in doc_ids if d in all_docs]
-    return list(all_docs.values())
+def generate_response(prompt: str, max_new_tokens: int = 200) -> str:
+    device = next(model.parameters()).device
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    output = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+    )
+
+    if is_encoder_decoder:
+        return tokenizer.decode(output[0], skip_special_tokens=True)
+
+    return tokenizer.decode(
+        output[0][inputs["input_ids"].shape[1]:],
+        skip_special_tokens=True,
+    )
 
 
-def merged_similarity_search(vectorstores: list[FAISS], query: str, k: int = 4) -> list:
-    """
-    Perform similarity search across multiple FAISS stores and return
-    the top-k chunks merged from all stores (de-duplicated by content).
-    """
-    seen = set()
-    results = []
-    per_store_k = max(k, k * 2 // max(len(vectorstores), 1))
-    for vs in vectorstores:
-        for doc in vs.similarity_search(query, k=per_store_k):
-            if doc.page_content not in seen:
-                seen.add(doc.page_content)
-                results.append(doc)
-    return results[:k * len(vectorstores)]  # return more chunks for multi-doc
+# ===============================
+# HEALTH ENDPOINTS (kept from enhancement branch)
+# ===============================
+@app.get("/healthz")
+def health_check():
+    return {"status": "healthy"}
 
 
+@app.get("/readyz")
+def readiness_check():
+    return {"status": "ready"}
 
-class CompareRequest(BaseModel):
-    session_id: str
 
-# -------------------------------------------------------------------
-# SESSION CLEANUP
-# -------------------------------------------------------------------
+# ===============================
+# UPLOAD (NO AUTH, RETURNS session_id)
+# ===============================
+@app.post("/upload")
+@limiter.limit("10/15 minutes")
+async def upload_file(request: Request, file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        return {"error": "Only PDF files are supported"}
 
-    # Normalize at ingestion
-    cleaned_docs = [
-        Document(
-            page_content=normalize_spaced_text(doc.page_content),
-            metadata=doc.metadata
+    session_id = str(uuid4())
+    upload_dir = "uploads"
+    os.makedirs(upload_dir, exist_ok=True)
+    file_path = os.path.join(upload_dir, f"{uuid4().hex}_{file.filename}")
+
+    try:
+        with open(file_path, "wb") as buffer:
+            buffer.write(await file.read())
+
+        loader = PyPDFLoader(file_path)
+        docs = loader.load()
+
+        splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=100
         )
-        for doc in raw_docs
-    ]
+        chunks = splitter.split_documents(docs)
 
-def cleanup_expired_sessions():
-    now = time.time()
-    expired = [k for k, v in sessions.items()
-               if now - v["last"] > SESSION_TIMEOUT]
-    for k in expired:
-        del sessions[k]
+        vectorstore = FAISS.from_documents(chunks, embedding_model)
 
-    vectorstore = FAISS.from_documents(chunks, embedding_model)
+        sessions[session_id] = {
+            "vectorstores": [vectorstore],
+            "last_accessed": time.time()
+        }
 
-    # Generate a unique doc_id for this PDF
-    doc_id = str(uuid.uuid4())
+        return {
+            "message": "PDF uploaded and processed",
+            "session_id": session_id
+        }
 
-    if data.session_id not in sessions:
-        sessions[data.session_id] = {"docs": {}, "last_accessed": time.time()}
-
-    sessions[data.session_id]["docs"][doc_id] = vectorstore
-    sessions[data.session_id]["last_accessed"] = time.time()
-
-    return {"message": "PDF processed successfully", "doc_id": doc_id}
+    except Exception as e:
+        return {"error": f"Upload failed: {str(e)}"}
 
 
+# ===============================
+# ASK (USES session_ids — matches fixed App.js)
+# ===============================
 @app.post("/ask")
 @limiter.limit("60/15 minutes")
 def ask_question(request: Request, data: AskRequest):
@@ -422,85 +361,70 @@ Answer:"""
 
     return {"answer": normalize_answer(answer), "confidence_score": 85}
 
+# ===============================
+# SUMMARIZE
+# ===============================
 @app.post("/summarize")
 @limiter.limit("15/15 minutes")
 def summarize_pdf(request: Request, data: SummarizeRequest):
     cleanup_expired_sessions()
 
-    session_data = sessions.get(data.session_id)
-    if not session_data:
-        return {"summary": "Session expired or no PDF uploaded for this session."}
+    if not data.session_ids:
+        return {"summary": "No session selected."}
 
-    session_data["last_accessed"] = time.time()
+    vectorstores = []
+    for sid in data.session_ids:
+        session = sessions.get(sid)
+        if session:
+            vectorstores.extend(session["vectorstores"])
 
-    vectorstores = get_session_docs(data.session_id, data.doc_ids)
     if not vectorstores:
-        return {"summary": "No documents found for the selected session."}
+        return {"summary": "No documents found."}
 
-    docs = merged_similarity_search(vectorstores, "Give a concise summary of the document.", k=6)
-    if not docs:
-        return {"summary": "No document context available to summarize."}
+    docs = []
+    for vs in vectorstores:
+        docs.extend(vs.similarity_search("Summarize the document", k=6))
 
-    context = "\n\n".join([doc.page_content for doc in docs])
+    context = "\n\n".join([d.page_content for d in docs])
 
-    prompt = (
-        "Summarize the following document excerpt in 5-7 clear bullet points.\n"
-        "Each bullet point must state one key fact (who, what, when, where, or why).\n"
-        "Use ONLY the information provided below. Do NOT add assumptions.\n"
-        "Do NOT repeat these instructions in your response.\n\n"
-        f"Document excerpt:\n{context}\n\n"
-        "Summary:"
-    )
+    prompt = f"Summarize this document:\n\n{context}\n\nSummary:"
+    summary = generate_response(prompt, 250)
 
-    raw_summary = generate_response(prompt, max_new_tokens=300)
-    # Post-process: strip any leaked prompt sections from the generated summary.
-    summary = extract_final_answer(raw_summary)
     return {"summary": summary}
 
 
+# ===============================
+# COMPARE
+# ===============================
 @app.post("/compare")
 @limiter.limit("10/15 minutes")
 def compare_documents(request: Request, data: CompareRequest):
     cleanup_expired_sessions()
 
-    session_data = sessions.get(data.session_id)
-    if not session_data:
-        return {"comparison": "Session expired or no PDFs uploaded for this session."}
+    if len(data.session_ids) < 2:
+        return {"comparison": "Select at least 2 documents."}
 
-    if len(data.doc_ids) < 2:
-        return {"comparison": "Please select at least 2 documents to compare."}
+    contexts = []
+    for sid in data.session_ids:
+        session = sessions.get(sid)
+        if session:
+            vs = session["vectorstores"][0]
+            chunks = vs.similarity_search("main topics", k=4)
+            text = "\n".join([c.page_content for c in chunks])
+            contexts.append(text)
 
-    session_data["last_accessed"] = time.time()
+    if len(contexts) < 2:
+        return {"comparison": "Not enough documents to compare."}
 
-    vectorstores = get_session_docs(data.session_id, data.doc_ids)
-    if len(vectorstores) < 2:
-        return {"comparison": "Could not find enough documents in the session. Please re-upload."}
-
-    # Retrieve top chunks from each document separately for fair comparison
-    query = "summarize the main topic, purpose, and key details of this document"
-    per_doc_contexts = []
-    for i, vs in enumerate(vectorstores):
-        chunks = vs.similarity_search(query, k=4)
-        text = "\n".join([c.page_content for c in chunks])
-        per_doc_contexts.append(f"Document {i + 1}:\n{text}")
-
-    combined_context = "\n\n---\n\n".join(per_doc_contexts)
+    combined = "\n\n---\n\n".join(contexts)
 
     prompt = (
-        "You are a document comparison assistant.\n"
-        "Compare the documents below and produce a structured comparison with:\n"
-        "1. A brief overview of each document.\n"
-        "2. Key similarities.\n"
-        "3. Key differences.\n"
-        "Base your comparison ONLY on the provided excerpts. Do NOT invent information.\n"
-        "Do NOT repeat these instructions.\n\n"
-        f"{combined_context}\n\n"
-        "Comparison:"
+        "Compare the documents below.\n"
+        "Give similarities and differences.\n\n"
+        f"{combined}\n\nComparison:"
     )
 
-    raw = generate_response(prompt, max_new_tokens=400)
-    # Post-process: ensure comparison output contains no leaked prompt text.
-    comparison = extract_final_answer(raw)
+    comparison = generate_response(prompt, 300)
     return {"comparison": comparison}
 
 
@@ -510,4 +434,4 @@ def health():
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=5000)
