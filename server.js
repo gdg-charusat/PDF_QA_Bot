@@ -105,6 +105,7 @@ app.get("/health", (req, res) => {
   res.json({ status: "ok" });
 });
 
+<<<<<<< HEAD
 
 // ── Auth proxy routes (public — no JWT required) ──────────────────────────────
 // These forward register/login requests to the FastAPI RAG service which
@@ -181,6 +182,9 @@ app.post("/upload", requireAuth, uploadLimiter, upload.single("file"), async (re
 
     const formData = new FormData();
     const fileStream = fs.createReadStream(req.file.path);
+=======
+    const filePath = path.resolve(req.file.path);
+>>>>>>> upstream/master
 
     const response = await axios.post(
       `${RAG_URL}/upload`,

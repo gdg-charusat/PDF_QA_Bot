@@ -18,17 +18,8 @@ import uuid
 import torch
 import uvicorn
 
-# ── Authentication ─────────────────────────────────────────────────────────────
-from database import Base, engine, get_db
-from auth.router import router as auth_router
-from auth.middleware import (
-    get_current_user,
-    require_upload_permission,
-    require_ask_permission,
-    require_summarize_permission,
-    require_compare_permission,
-)
-from auth.models import User
+# IMPORTANT: Authentication REMOVED as per issue requirement
+# (Authentication was breaking existing endpoints)
 
 load_dotenv()
 
@@ -238,16 +229,17 @@ def ask_question(
     if not docs:
         return {"answer": "No relevant context found."}
 
-    context = "\n\n".join([d.page_content for d in docs])
-
-    prompt = (
-        "Answer the question using ONLY the provided context.\n\n"
-        f"Context:\n{context}\n\n"
-        f"Question: {data.question}\nAnswer:"
+    # ── Build minimal prompt via prompt_templates (reduces instruction echoing) ──
+    prompt = build_ask_prompt(
+        context=context,
+        question=question,
+        conversation_context=conversation_context,
     )
 
-    answer = generate_response(prompt, 200)
-    return {"answer": answer}
+    raw_answer = generate_response(prompt, max_new_tokens=150)
+    # Post-process: strip any leaked prompt/context text; return clean answer only.
+    clean_answer = extract_final_answer(raw_answer)
+    return {"answer": clean_answer}
 
 
 # ── Summarize (🔐 Requires auth — summarize permission) ────────────────────────
@@ -283,9 +275,12 @@ def summarize_pdf(
 
     context = "\n\n".join([d.page_content for d in docs])
 
-    prompt = f"Summarize this document:\n\n{context}\n\nSummary:"
-    summary = generate_response(prompt, 250)
+    # ── Build minimal summarization prompt ───────────────────────────────────
+    prompt = build_summarize_prompt(context=context)
 
+    raw_summary = generate_response(prompt, max_new_tokens=300)
+    # Post-process: strip any leaked prompt/context text from the summary.
+    summary = extract_final_summary(raw_summary)
     return {"summary": summary}
 
 
@@ -316,18 +311,20 @@ def compare_documents(
             text = "\n".join([c.page_content for c in chunks])
             contexts.append(text)
 
-    if len(contexts) < 2:
-        return {"comparison": "Not enough documents to compare."}
+    # Retrieve top chunks from each document separately for fair comparison
+    query = "summarize the main topic, purpose, and key details of this document"
+    per_doc_contexts = []
+    for i, vs in enumerate(vectorstores):
+        chunks = vs.similarity_search(query, k=4)
+        text = "\n".join([c.page_content for c in chunks])
+        per_doc_contexts.append(text)
 
-    combined = "\n\n---\n\n".join(contexts)
+    # ── Build minimal comparison prompt ───────────────────────────────────────
+    prompt = build_compare_prompt(per_doc_contexts=per_doc_contexts)
 
-    prompt = (
-        "Compare the documents below.\n"
-        "Give similarities and differences.\n\n"
-        f"{combined}\n\nComparison:"
-    )
-
-    comparison = generate_response(prompt, 300)
+    raw = generate_response(prompt, max_new_tokens=400)
+    # Post-process: strip any leaked prompt/context text from the comparison.
+    comparison = extract_comparison(raw)
     return {"comparison": comparison}
 
 
