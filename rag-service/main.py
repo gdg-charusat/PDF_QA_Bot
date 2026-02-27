@@ -186,6 +186,9 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
             chunk.metadata["page_number"] = page_num
             chunk.metadata["file_name"] = file.filename
 
+        if not chunks:
+            return {"error": "Upload failed: No extractable text found in the document (OCR yielded nothing)."}
+
         vectorstore = FAISS.from_documents(chunks, embedding_model)
 
         sessions[session_id] = {
@@ -230,16 +233,17 @@ def ask_question(request: Request, data: AskRequest):
     if not docs:
         return {"answer": "No relevant context found."}
 
-    context = "\n\n".join([d.page_content for d in docs])
-
-    prompt = (
-        "Answer the question using ONLY the provided context.\n\n"
-        f"Context:\n{context}\n\n"
-        f"Question: {data.question}\nAnswer:"
+    # ── Build minimal prompt via prompt_templates (reduces instruction echoing) ──
+    prompt = build_ask_prompt(
+        context=context,
+        question=question,
+        conversation_context=conversation_context,
     )
 
-    answer = generate_response(prompt, 200)
-    return {"answer": answer}
+    raw_answer = generate_response(prompt, max_new_tokens=150)
+    # Post-process: strip any leaked prompt/context text; return clean answer only.
+    clean_answer = extract_final_answer(raw_answer)
+    return {"answer": clean_answer}
 
 
 # ===============================
@@ -268,9 +272,12 @@ def summarize_pdf(request: Request, data: SummarizeRequest):
 
     context = "\n\n".join([d.page_content for d in docs])
 
-    prompt = f"Summarize this document:\n\n{context}\n\nSummary:"
-    summary = generate_response(prompt, 250)
+    # ── Build minimal summarization prompt ───────────────────────────────────
+    prompt = build_summarize_prompt(context=context)
 
+    raw_summary = generate_response(prompt, max_new_tokens=300)
+    # Post-process: strip any leaked prompt/context text from the summary.
+    summary = extract_final_summary(raw_summary)
     return {"summary": summary}
 
 

@@ -95,14 +95,7 @@ app.get("/readyz", async (req, res) => {
 });
 
 
-app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
-  try {
-    if (!req.file) {
-      return res.status(400).json({ error: "No file uploaded." });
-    }
-
-    const formData = new FormData();
-    const fileStream = fs.createReadStream(req.file.path);
+    const filePath = path.resolve(req.file.path);
 
     const response = await axios.post(
       `${RAG_URL}/upload`,
