@@ -17,9 +17,16 @@ import time
 import uuid
 import torch
 import uvicorn
+import pdf2image
+import pytesseract
+from PIL import Image
 
-# IMPORTANT: Authentication REMOVED as per issue requirement
-# (Authentication was breaking existing endpoints)
+# Post-processing helpers: strip prompt echoes / context leakage from LLM output
+# so that the API always returns only the clean, user-facing answer/summary/comparison.
+from utils.postprocess import extract_final_answer, extract_final_summary, extract_comparison
+
+# Centralised minimal prompt builders (short prompts → less instruction echoing).
+from utils.prompt_templates import build_ask_prompt, build_summarize_prompt, build_compare_prompt
 
 load_dotenv()
 
@@ -158,11 +165,38 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         loader = PyPDFLoader(file_path)
         docs = loader.load()
 
+        # Check if each page has extractable text
+        final_docs = []
+        images = None
+        
+        for i, doc in enumerate(docs):
+            if len(doc.page_content.strip()) < 50:
+                # Fallback to OCR for this specific page
+                if images is None:
+                    print("Low text content detected on one or more pages. Falling back to OCR...")
+                    images = pdf2image.convert_from_path(file_path)
+                
+                if i < len(images):
+                    ocr_text = pytesseract.image_to_string(images[i])
+                    final_docs.append(Document(
+                        page_content=ocr_text,
+                        metadata={"source": file_path, "page": i}
+                    ))
+                else:
+                    final_docs.append(doc)
+            else:
+                final_docs.append(doc)
+
+        docs = final_docs
+
         splitter = RecursiveCharacterTextSplitter(
             chunk_size=1000,
             chunk_overlap=100
         )
         chunks = splitter.split_documents(docs)
+
+        if not chunks:
+            return {"error": "Upload failed: No extractable text found in the document (OCR yielded nothing)."}
 
         vectorstore = FAISS.from_documents(chunks, embedding_model)
 
@@ -208,16 +242,17 @@ def ask_question(request: Request, data: AskRequest):
     if not docs:
         return {"answer": "No relevant context found."}
 
-    context = "\n\n".join([d.page_content for d in docs])
-
-    prompt = (
-        "Answer the question using ONLY the provided context.\n\n"
-        f"Context:\n{context}\n\n"
-        f"Question: {data.question}\nAnswer:"
+    # ── Build minimal prompt via prompt_templates (reduces instruction echoing) ──
+    prompt = build_ask_prompt(
+        context=context,
+        question=question,
+        conversation_context=conversation_context,
     )
 
-    answer = generate_response(prompt, 200)
-    return {"answer": answer}
+    raw_answer = generate_response(prompt, max_new_tokens=150)
+    # Post-process: strip any leaked prompt/context text; return clean answer only.
+    clean_answer = extract_final_answer(raw_answer)
+    return {"answer": clean_answer}
 
 
 # ===============================
@@ -246,9 +281,12 @@ def summarize_pdf(request: Request, data: SummarizeRequest):
 
     context = "\n\n".join([d.page_content for d in docs])
 
-    prompt = f"Summarize this document:\n\n{context}\n\nSummary:"
-    summary = generate_response(prompt, 250)
+    # ── Build minimal summarization prompt ───────────────────────────────────
+    prompt = build_summarize_prompt(context=context)
 
+    raw_summary = generate_response(prompt, max_new_tokens=300)
+    # Post-process: strip any leaked prompt/context text from the summary.
+    summary = extract_final_summary(raw_summary)
     return {"summary": summary}
 
 
@@ -272,18 +310,20 @@ def compare_documents(request: Request, data: CompareRequest):
             text = "\n".join([c.page_content for c in chunks])
             contexts.append(text)
 
-    if len(contexts) < 2:
-        return {"comparison": "Not enough documents to compare."}
+    # Retrieve top chunks from each document separately for fair comparison
+    query = "summarize the main topic, purpose, and key details of this document"
+    per_doc_contexts = []
+    for i, vs in enumerate(vectorstores):
+        chunks = vs.similarity_search(query, k=4)
+        text = "\n".join([c.page_content for c in chunks])
+        per_doc_contexts.append(text)
 
-    combined = "\n\n---\n\n".join(contexts)
+    # ── Build minimal comparison prompt ───────────────────────────────────────
+    prompt = build_compare_prompt(per_doc_contexts=per_doc_contexts)
 
-    prompt = (
-        "Compare the documents below.\n"
-        "Give similarities and differences.\n\n"
-        f"{combined}\n\nComparison:"
-    )
-
-    comparison = generate_response(prompt, 300)
+    raw = generate_response(prompt, max_new_tokens=400)
+    # Post-process: strip any leaked prompt/context text from the comparison.
+    comparison = extract_comparison(raw)
     return {"comparison": comparison}
 
 

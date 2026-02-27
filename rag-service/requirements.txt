@@ -14,6 +14,9 @@ python-docx
 requests
 numpy
 slowapi
+pdf2image
+pytesseract
+Pillow
 
 # Authentication dependencies
 python-jose[cryptography]
