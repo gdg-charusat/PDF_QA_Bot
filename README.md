@@ -33,6 +33,56 @@ Upload a PDF, ask questions from its content, and generate a short summary. You 
 4. For `/ask` and `/summarize`, FastAPI retrieves relevant chunks and generates output with a Hugging Face model
 5. **🔐 All API endpoints now require valid JWT authentication**
 
+---
+
+## 📄 Page-Level Citations
+
+Every answer from the `/ask` endpoint now includes a `citations` array that tells you **exactly which page(s)** of which PDF the answer was retrieved from.
+
+### How it works
+
+| Step | What happens |
+|------|-------------|
+| **Upload** | `PyPDFLoader` loads the PDF and assigns a `page` index (0-based) to every chunk. `RecursiveCharacterTextSplitter` preserves that metadata when splitting. |
+| **Retrieval** | `similarity_search` returns the top-K most relevant chunks, each carrying its `page` metadata. |
+| **Context building** | Each retrieved chunk is prefixed with `[Page N]` before being sent to the generation model, so the model is page-aware. |
+| **Response** | The API returns both the generated `answer` and a sorted, deduplicated `citations` list. |
+
+### API response format
+
+```json
+{
+  "answer": "The contract was signed on January 1st, 2024.",
+  "citations": [
+    { "page": 3, "source": "contract_2024.pdf" },
+    { "page": 7, "source": "contract_2024.pdf" }
+  ]
+}
+```
+
+- `page` — **1-indexed** page number (page 1 = first page of the PDF).
+- `source` — original filename of the uploaded PDF.
+- The list is sorted by `source` then `page`, and deduplicated (one entry per unique page per file).
+
+### Frontend display
+
+Citation badges are shown below each bot answer in the chat UI:
+
+```
+Bot: The contract was signed on January 1st, 2024.
+  📄 contract_2024.pdf — p.3   📄 contract_2024.pdf — p.7
+```
+
+### Running citation tests
+
+```bash
+cd rag-service
+pytest tests/test_citations.py -v
+```
+
+---
+
+
 ## Project Structure
 
 ```text

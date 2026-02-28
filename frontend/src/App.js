@@ -87,9 +87,13 @@ function App() {
         question: question.trim(),
         sessionId: sessionId
       });
-      setChat(prev => [...prev, { role: "bot", text: res.data.answer }]);
+      setChat(prev => [...prev, {
+        role: "bot",
+        text: res.data.answer,
+        citations: res.data.citations || []
+      }]);
     } catch (e) {
-      setChat(prev => [...prev, { role: "bot", text: "Error getting answer. Please check if the document was uploaded for this session." }]);
+      setChat(prev => [...prev, { role: "bot", text: "Error getting answer. Please check if the document was uploaded for this session.", citations: [] }]);
     }
     setQuestion("");
     setAsking(false);
@@ -174,6 +178,19 @@ function App() {
                   <Typography variant="body2">
                     <b>{msg.role === "user" ? "You" : "Bot"}:</b> {msg.text}
                   </Typography>
+                  {msg.role === "bot" && msg.citations && msg.citations.length > 0 && (
+                    <Box mt={0.5} display="flex" flexWrap="wrap" gap={0.5}>
+                      {msg.citations.map((c, j) => (
+                        <Typography
+                          key={j}
+                          variant="caption"
+                          sx={{ bgcolor: "grey.400", px: 1, py: 0.3, borderRadius: 1, display: "inline-block" }}
+                        >
+                          📄 {c.source} — p.{c.page}
+                        </Typography>
+                      ))}
+                    </Box>
+                  )}
                 </Box>
               </Box>
             ))

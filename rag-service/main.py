@@ -156,7 +156,14 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
     session_id = str(uuid4())
     upload_dir = "uploads"
     os.makedirs(upload_dir, exist_ok=True)
-    file_path = os.path.join(upload_dir, f"{uuid4().hex}_{file.filename}")
+    # SECURITY: Use only uuid4().hex to prevent path traversal from client filename
+    file_path = os.path.join(upload_dir, f"{uuid4().hex}.pdf")
+    upload_dir_resolved = os.path.abspath(upload_dir)
+    file_path_resolved = os.path.abspath(file_path)
+    
+    # SECURITY: Validate that file_path is within upload_dir (prevent path traversal)
+    if not file_path_resolved.startswith(upload_dir_resolved + os.sep):
+        return {"error": "Upload failed: Invalid file path detected."}
 
     try:
         with open(file_path, "wb") as buffer:
@@ -202,16 +209,31 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
 
         sessions[session_id] = {
             "vectorstores": [vectorstore],
+            "filename": file.filename,
             "last_accessed": time.time()
         }
 
         return {
             "message": "PDF uploaded and processed",
-            "session_id": session_id
+            "session_id": session_id,
+            "page_count": len(docs)
         }
 
     except Exception as e:
         return {"error": f"Upload failed: {str(e)}"}
+    
+    finally:
+        # FIX: Delete PDF file after processing to prevent disk space exhaustion (Issue #110)
+        # This ensures the physical file is deleted even if OCR or embedding fails
+        try:
+            os.remove(file_path)
+        except FileNotFoundError:
+            # File already deleted or never created; nothing to clean up
+            pass
+        except OSError as delete_err:
+            # Log other errors but don't crash
+            print(f"[/upload] Warning: Failed to delete file: {str(delete_err)}")
+
 
 
 # ===============================
@@ -223,36 +245,65 @@ def ask_question(request: Request, data: AskRequest):
     cleanup_expired_sessions()
 
     if not data.session_ids:
-        return {"answer": "No session selected."}
+        return {"answer": "No session selected.", "citations": []}
 
-    vectorstores = []
+    # Update last_accessed for all sessions
     for sid in data.session_ids:
         session = sessions.get(sid)
         if session:
             session["last_accessed"] = time.time()
-            vectorstores.extend(session["vectorstores"])
 
-    if not vectorstores:
-        return {"answer": "No documents found for selected sessions."}
+    # Gather retrieved docs with their session filenames
+    docs_with_meta = []
+    for sid in data.session_ids:
+        session = sessions.get(sid)
+        if session:
+            vs = session["vectorstores"][0]
+            filename = session.get("filename", "unknown")
+            retrieved = vs.similarity_search(data.question, k=4)
+            for doc in retrieved:
+                docs_with_meta.append({
+                    "doc": doc,
+                    "filename": filename,
+                    "sid": sid
+                })
 
-    docs = []
-    for vs in vectorstores:
-        docs.extend(vs.similarity_search(data.question, k=4))
+    if not docs_with_meta:
+        return {"answer": "No relevant context found.", "citations": []}
 
-    if not docs:
-        return {"answer": "No relevant context found."}
+    # Build context with page annotations for the prompt
+    context_parts = []
+    for item in docs_with_meta:
+        # PyPDFLoader sets metadata["page"] as 0-indexed
+        raw_page = item["doc"].metadata.get("page", 0)
+        page_num = int(raw_page) + 1  # Convert to 1-indexed
+        context_parts.append(f"[Page {page_num}] {item['doc'].page_content}")
 
-    # ── Build minimal prompt via prompt_templates (reduces instruction echoing) ──
-    prompt = build_ask_prompt(
-        context=context,
-        question=question,
-        conversation_context=conversation_context,
-    )
+    context = "\n\n".join(context_parts)
 
+    # Use minimal prompt builder to reduce instruction echoing (upstream fix)
+    prompt = build_ask_prompt(context=context, question=data.question)
     raw_answer = generate_response(prompt, max_new_tokens=150)
-    # Post-process: strip any leaked prompt/context text; return clean answer only.
+    # Strip any leaked prompt/context text from the raw output
     clean_answer = extract_final_answer(raw_answer)
-    return {"answer": clean_answer}
+
+    # Build deduplicated, sorted citations
+    seen = set()
+    citations = []
+    for item in docs_with_meta:
+        raw_page = item["doc"].metadata.get("page", 0)
+        page_num = int(raw_page) + 1
+        key = (item["filename"], page_num)
+        if key not in seen:
+            seen.add(key)
+            citations.append({
+                "page": page_num,
+                "source": item["filename"]
+            })
+
+    citations.sort(key=lambda c: (c["source"], c["page"]))
+
+    return {"answer": clean_answer, "citations": citations}
 
 
 # ===============================
