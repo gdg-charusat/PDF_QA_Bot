@@ -1,11 +1,12 @@
 import React, { useState } from "react";
 import { Card, Form, Button, Spinner } from "react-bootstrap";
 import ReactMarkdown from "react-markdown";
-import { askQuestion, summarizeDocuments } from "../services/api";
+import { askQuestion, askQuestionStream, summarizeDocuments } from "../services/api";
 
 /**
  * ChatInterface component
  * Handles asking questions and summarizing documents
+ * Issue #118: Implements real-time token streaming for improved UX
  */
 const ChatInterface = ({
   chatHistory,
@@ -19,6 +20,7 @@ const ChatInterface = ({
   const [question, setQuestion] = useState("");
   const [asking, setAsking] = useState(false);
   const [summarizing, setSummarizing] = useState(false);
+  const [useStreaming] = useState(true); // Enable streaming by default
 
   const handleAskQuestion = async () => {
     if (!question.trim() || selectedDocCount === 0) {
@@ -34,16 +36,51 @@ const ChatInterface = ({
     setQuestion("");
 
     try {
-      const response = await askQuestion(
-        questionText,
-        sessionId,
-        selectedDocIds
-      );
-      onChatUpdate({
-        role: "bot",
-        text: response.text,
-        confidence: response.confidence,
-      });
+      // Use streaming for real-time feedback (Issue #118)
+      if (useStreaming) {
+        let fullAnswer = "";
+        let citations = [];
+
+        await askQuestionStream(
+          questionText,
+          selectedDocIds.length > 0 ? [sessionId] : [],
+          (token) => {
+            // Accumulate tokens
+            fullAnswer += token;
+            // Update chat incrementally as tokens arrive (streaming effect)
+            onChatUpdate({
+              role: "bot",
+              text: fullAnswer,
+              isStreaming: true,
+              citations: citations,
+            });
+          },
+          (newCitations) => {
+            // Update citations when they arrive
+            citations = newCitations;
+          }
+        );
+
+        // Finalize message (not streaming anymore)
+        onChatUpdate({
+          role: "bot",
+          text: fullAnswer,
+          isStreaming: false,
+          citations: citations,
+        });
+      } else {
+        // Fallback to non-streaming mode for compatibility
+        const response = await askQuestion(
+          questionText,
+          sessionId,
+          selectedDocIds
+        );
+        onChatUpdate({
+          role: "bot",
+          text: response.text,
+          confidence: response.confidence,
+        });
+      }
     } catch (error) {
       onChatUpdate({
         role: "bot",
@@ -121,8 +158,34 @@ const ChatInterface = ({
                       Confidence: {msg.confidence}%
                     </span>
                   )}
+                  {msg.isStreaming && (
+                    <span
+                      className="badge bg-info"
+                      style={{ fontSize: "0.7rem" }}
+                    >
+                      Streaming...
+                    </span>
+                  )}
                 </div>
                 <ReactMarkdown>{msg.text}</ReactMarkdown>
+                {msg.citations && msg.citations.length > 0 && (
+                  <div
+                    style={{
+                      marginTop: "8px",
+                      fontSize: "0.85rem",
+                      color: "#666",
+                      borderLeft: "2px solid #ddd",
+                      paddingLeft: "8px",
+                    }}
+                  >
+                    <strong>Sources:</strong>
+                    {msg.citations.map((c, idx) => (
+                      <div key={idx}>
+                        - {c.source} (Page {c.page})
+                      </div>
+                    ))}
+                  </div>
+                )}
               </div>
             ))
           )}

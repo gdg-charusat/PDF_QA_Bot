@@ -96,6 +96,99 @@ export const askQuestion = async (question, sessionId, doc_ids) => {
 };
 
 /**
+ * Ask a question with real-time token streaming (Issue #118)
+ * Uses Server-Sent Events (SSE) to stream tokens as they're generated.
+ * Provides chatGPT-like typing effect in the UI.
+ * 
+ * @param {string} question - The question to ask
+ * @param {string[]} session_ids - Array of session IDs to query
+ * @param {Function} onToken - Callback called for each token (receives token string)
+ * @param {Function} onCitations - Callback called when citations arrive (receives citations array)
+ * @returns {Promise<void>}
+ */
+export const askQuestionStream = async (question, session_ids, onToken, onCitations) => {
+  if (!question.trim()) {
+    throw new Error("Question cannot be empty");
+  }
+
+  if (session_ids.length === 0) {
+    throw new Error("Please select at least one document");
+  }
+
+  if (question.length > 2000) {
+    throw new Error("Question too long (max 2000 characters)");
+  }
+
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 60_000);
+
+  try {
+    const response = await fetch(`${API_BASE}/ask-stream`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        question,
+        session_ids,
+      }),
+      signal: controller.signal,
+    });
+
+    if (!response.ok) {
+      const error = await response.json();
+      throw new Error(error.error || "Error streaming answer");
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n\n");
+      
+      // Keep the last incomplete line in the buffer
+      buffer = lines[lines.length - 1];
+
+      // Process complete SSE messages
+      for (let i = 0; i < lines.length - 1; i++) {
+        const line = lines[i].trim();
+        if (line.startsWith("data: ")) {
+          try {
+            const data = JSON.parse(line.slice(6));
+            
+            if (data.error) {
+              throw new Error(data.error);
+            }
+            
+            if (data.type === "metadata" && data.citations) {
+              onCitations(data.citations);
+            } else if (data.token) {
+              onToken(data.token);
+            } else if (data.done) {
+              break;
+            }
+          } catch (e) {
+            console.error("Error parsing SSE message:", e);
+          }
+        }
+      }
+    }
+  } catch (error) {
+    if (error.name === "AbortError") {
+      throw new Error("Request timed out.");
+    }
+    throw new Error(error.message || "Error streaming answer");
+  } finally {
+    clearTimeout(timeoutId);
+  }
+};
+
+/**
  * Summarize selected documents
  * @param {string} sessionId - Session identifier
  * @param {string[]} doc_ids - Array of document IDs to summarize

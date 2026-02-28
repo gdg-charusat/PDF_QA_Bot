@@ -1,5 +1,6 @@
 from fastapi import FastAPI, Request, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -15,6 +16,7 @@ import os
 import time
 import uuid
 import threading
+import json
 import uvicorn
 import pdf2image
 import pytesseract
@@ -76,6 +78,7 @@ try:
         AutoTokenizer,
         AutoModelForSeq2SeqLM,
         AutoModelForCausalLM,
+        TextIteratorStreamer,
     )
     _cfg = AutoConfig.from_pretrained(HF_GENERATION_MODEL)
     _is_encoder_decoder = bool(getattr(_cfg, "is_encoder_decoder", False))
@@ -148,6 +151,46 @@ def generate_response(prompt: str, max_new_tokens: int = 200) -> str:
         output[0][inputs["input_ids"].shape[1]:],
         skip_special_tokens=True,
     )
+
+
+def generate_response_streaming(prompt: str, max_new_tokens: int = 200):
+    """
+    Stream tokens from LLM generation in real-time using TextIteratorStreamer.
+    Yields Server-Sent Events (SSE) format: "data: {token_json}\\n\\n"
+
+    This enables ChatGPT-like typing effect on the frontend with real-time feedback.
+    Issue #118: Real-Time LLM Token Streaming
+    """
+    if _model is None or _tokenizer is None:
+        yield f"data: {json.dumps({'error': 'generation_model_unavailable'})}\n\n"
+        return
+
+    device = next(_model.parameters()).device
+    inputs = _tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    streamer = TextIteratorStreamer(_tokenizer, skip_prompt=True, skip_special_tokens=True)
+
+    generation_kwargs = {
+        **inputs,
+        "max_new_tokens": max_new_tokens,
+        "do_sample": False,
+        "pad_token_id": _tokenizer.pad_token_id or _tokenizer.eos_token_id,
+        "streamer": streamer,
+    }
+
+    thread = threading.Thread(target=_model.generate, kwargs=generation_kwargs)
+    thread.start()
+
+    collected_tokens = []
+    try:
+        for token in streamer:
+            collected_tokens.append(token)
+            yield f"data: {json.dumps({'token': token})}\n\n"
+    finally:
+        thread.join()
+
+    yield f"data: {json.dumps({'done': True})}\n\n"
 
 
 # ===============================
@@ -333,6 +376,84 @@ def ask_question(request: Request, data: AskRequest):
     citations.sort(key=lambda c: (c["source"], c["page"]))
 
     return {"answer": clean_answer, "citations": citations}
+
+
+# ===============================
+# ASK STREAM (REAL-TIME TOKEN STREAMING - Issue #118)
+# ===============================
+@app.post("/ask-stream")
+@limiter.limit("60/15 minutes")
+def ask_question_stream(request: Request, data: AskRequest):
+    """
+    Stream token-by-token generation using Server-Sent Events (SSE).
+
+    Provides real-time typing effect similar to ChatGPT.
+    Issue #118: Real-Time LLM Token Streaming
+
+    Response format:
+    - Each line: "data: {\"token\": \"word \"}\\n\\n"
+    - End marker: "data: {\"done\": true}\\n\\n"
+    """
+    def generate():
+        cleanup_expired_sessions()
+
+        if not data.session_ids:
+            yield f"data: {json.dumps({'error': 'No session selected.'})}\n\n"
+            return
+
+        with _session_lock:
+            for sid in data.session_ids:
+                s = sessions.get(sid)
+                if s:
+                    s["last_accessed"] = time.time()
+            _snap = {
+                sid: sessions[sid]
+                for sid in data.session_ids
+                if sid in sessions
+            }
+
+        docs_with_meta = []
+        for sid, session in _snap.items():
+            vs = session["vectorstores"][0]
+            filename = session.get("filename", "unknown")
+            retrieved = vs.similarity_search(data.question, k=4)
+            for doc in retrieved:
+                docs_with_meta.append({
+                    "doc": doc,
+                    "filename": filename,
+                    "sid": sid
+                })
+
+        if not docs_with_meta:
+            yield f"data: {json.dumps({'error': 'No relevant context found.'})}\n\n"
+            return
+
+        context_parts = []
+        for item in docs_with_meta:
+            raw_page = item["doc"].metadata.get("page", 0)
+            page_num = int(raw_page) + 1
+            context_parts.append(f"[Page {page_num}] {item['doc'].page_content}")
+
+        context = "\n\n".join(context_parts)
+        prompt = build_ask_prompt(context=context, question=data.question)
+
+        seen = set()
+        citations = []
+        for item in docs_with_meta:
+            raw_page = item["doc"].metadata.get("page", 0)
+            page_num = int(raw_page) + 1
+            key = (item["filename"], page_num)
+            if key not in seen:
+                seen.add(key)
+                citations.append({"page": page_num, "source": item["filename"]})
+
+        citations.sort(key=lambda c: (c["source"], c["page"]))
+        yield f"data: {json.dumps({'citations': citations, 'type': 'metadata'})}\n\n"
+
+        for token_chunk in generate_response_streaming(prompt, max_new_tokens=150):
+            yield token_chunk
+
+    return StreamingResponse(generate(), media_type="text/event-stream")
 
 
 # ===============================
