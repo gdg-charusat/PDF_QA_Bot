@@ -71,13 +71,14 @@ const storage = multer.diskStorage({
 const upload = multer({
   storage,
   limits: {
-    fileSize: 10 * 1024 * 1024, // 10MB limit
+    fileSize: 20 * 1024 * 1024, // 20MB limit
   },
   fileFilter: (req, file, cb) => {
-    if (file.mimetype === "application/pdf") {
+    const ext = path.extname(file.originalname).toLowerCase();
+    if (file.mimetype === "application/pdf" && ext === ".pdf") {
       cb(null, true);
     } else {
-      cb(new Error("Only PDF files are allowed"));
+      cb(new Error("Invalid file type. Only PDF files are accepted."));
     }
   },
 });
@@ -118,19 +119,7 @@ app.get("/health", (req, res) => {
 
 /* ================= ROUTES ================= */
 
-app.post(
-  "/upload",
-  uploadLimiter,
-  upload.single("file"),
-  async (req, res) => {
-    let filePath = null;
-
-    try {
-      if (!req.file) {
-        return res.status(400).json({ error: "No file uploaded." });
-// FIX: Upload endpoint with file cleanup to prevent disk space exhaustion (Issue #110)
 app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
-  // Guard against missing file to avoid accessing properties of undefined
   if (!req.file || !req.file.path) {
     return res.status(400).json({ error: "No file uploaded." });
   }
@@ -138,7 +127,6 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
   const filePath = path.resolve(req.file.path);
   const uploadDirResolved = path.resolve(UPLOAD_DIR);
   
-  // SECURITY: Validate that the file path is within UPLOAD_DIR (prevent path traversal)
   if (!filePath.startsWith(uploadDirResolved + path.sep) && filePath !== uploadDirResolved) {
     console.error("[/upload] Path traversal attempt detected:", filePath);
     return res.status(400).json({ error: "Invalid file path." });
@@ -147,10 +135,8 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
   let fileStream;
 
   try {
-    // Create a readable stream from the uploaded file
     fileStream = fs.createReadStream(filePath);
     
-    // Use FormData to send multipart data to FastAPI
     const FormData = require("form-data");
     const formData = new FormData();
     formData.append("file", fileStream);
@@ -162,102 +148,43 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
         headers: formData.getHeaders(),
         timeout: 180000,
       }
+    );
 
-      filePath = path.resolve(req.file.path);
+    if (req.session) {
+      req.session.currentSessionId = response.data.session_id;
+      req.session.chatHistory = [];
+    }
 
-      if (!fs.existsSync(filePath)) {
-        return res
-          .status(500)
-          .json({ error: "File upload failed - file not found on disk" });
-      }
-
-      console.log(
-        `Processing PDF: ${req.file.originalname} (${req.file.size} bytes)`
-      );
-
-      const formData = new (require("form-data"))();
-      const fileStream = fs.createReadStream(filePath);
-      formData.append("file", fileStream);
-
-      const response = await axios.post(
-        `${RAG_URL}/upload`,
-        formData,
-        {
-          headers: formData.getHeaders(),
-          timeout: 180000,
-        }
-      );
-
-      if (req.session) {
-        req.session.currentSessionId = response.data.session_id;
-        req.session.chatHistory = [];
-      }
-
-      return res.json({
-        message: response.data.message,
-        session_id: response.data.session_id,
-        filename: req.file.originalname,
-        size: req.file.size,
-      });
-    } catch (err) {
-      if (filePath && fs.existsSync(filePath)) {
-        try {
-          fs.unlinkSync(filePath);
-          console.log(`Cleaned up file after error: ${filePath}`);
-        } catch (cleanupErr) {
-          console.error(
-            `Failed to cleanup file: ${cleanupErr.message}`
-          );
-        }
-      }
-
-      if (err.code === "ECONNREFUSED") {
-        return res.status(503).json({
-          error: "RAG service unavailable",
-          details:
-            "Please ensure the Python service is running",
-        });
-      }
     return res.json({
       message: response.data.message,
       session_id: response.data.session_id,
+      filename: req.file.originalname,
+      size: req.file.size,
     });
   } catch (err) {
     console.error("[/upload]", err.response?.data || err.message);
+    
+    if (err.code === "ECONNREFUSED") {
+      return res.status(503).json({
+        error: "RAG service unavailable",
+        details: "Please ensure the Python service is running",
+      });
+    }
+    
     return res.status(500).json({ error: "Upload failed." });
   } finally {
-    // SECURITY: Destroy stream to prevent file descriptor leaks (especially on Windows)
     if (fileStream) {
       fileStream.destroy();
     }
     
-    // FIX: Delete uploaded file from Node server after processing (Issue #110)
-    // This prevents disk space exhaustion from orphaned PDF files
     fs.unlink(filePath, (unlinkErr) => {
       if (unlinkErr && unlinkErr.code !== "ENOENT") {
-        // Only log if it's not "file not found" (which is fine)
         console.warn(`[/upload] Failed to delete file: ${unlinkErr.message}`);
       }
     });
   }
 });
 
-      if (err.code === "LIMIT_FILE_SIZE") {
-        return res.status(413).json({
-          error: "File too large",
-          details: "Maximum file size is 10MB",
-        });
-      }
-
-      console.error("[/upload]", err.response?.data || err.message);
-
-      return res.status(500).json({
-        error: "Upload failed.",
-        details: err.response?.data || err.message,
-      });
-    }
-  }
-);
 
 app.post("/ask", askLimiter, async (req, res) => {
   const { question, session_ids } = req.body;
@@ -340,9 +267,8 @@ app.post("/compare", compareLimiter, async (req, res) => {
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError) {
     if (err.code === "LIMIT_FILE_SIZE") {
-      return res.status(413).json({
-        error: "File too large",
-        details: "Maximum file size is 10MB",
+      return res.status(400).json({
+        error: "File too large. Maximum allowed size is 20MB.",
       });
     }
     return res.status(400).json({ error: err.message });
