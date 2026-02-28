@@ -7,36 +7,45 @@ from langchain_community.vectorstores import FAISS
 from langchain_community.embeddings import HuggingFaceEmbeddings
 from langchain_core.documents import Document
 from dotenv import load_dotenv
-from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM
+from transformers import (
+    AutoConfig,
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,
+    AutoModelForCausalLM,
+)
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 from uuid import uuid4
 import os
 import time
-import uuid
 import torch
-import uvicorn
 import pdf2image
 import pytesseract
-from PIL import Image
 
-# Post-processing helpers: strip prompt echoes / context leakage from LLM output
-# so that the API always returns only the clean, user-facing answer/summary/comparison.
-from utils.postprocess import extract_final_answer, extract_final_summary, extract_comparison
+# ✅ Correct package imports
+from rag_service.utils.postprocess import (
+    extract_final_answer,
+    extract_final_summary,
+    extract_comparison,
+)
+from rag_service.utils.prompt_templates import (
+    build_ask_prompt,
+    build_summarize_prompt,
+    build_compare_prompt,
+)
 
-# Centralised minimal prompt builders (short prompts → less instruction echoing).
-from utils.prompt_templates import build_ask_prompt, build_summarize_prompt, build_compare_prompt
-
+# ---------------------------------------------------------------------
+# App setup
+# ---------------------------------------------------------------------
 load_dotenv()
 
 app = FastAPI(
     title="PDF QA Bot API",
     description="PDF Question-Answering Bot (Session-based, No Auth)",
-    version="2.1.0"
+    version="2.1.0",
 )
 
-# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -45,27 +54,33 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Rate Limiter
+# ---------------------------------------------------------------------
+# Rate limiting
+# ---------------------------------------------------------------------
 limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# ===============================
-# SESSION STORAGE (REQUIRED: keep sessionId)
-# ===============================
-# Format: { session_id: { "vectorstores": [FAISS], "last_accessed": float } }
+# ---------------------------------------------------------------------
+# Session storage
+# { session_id: { "vectorstores": [FAISS], "last_accessed": float } }
+# ---------------------------------------------------------------------
 sessions = {}
 SESSION_TIMEOUT = 3600  # 1 hour
 
+# ---------------------------------------------------------------------
 # Embedding model (loaded once)
+# ---------------------------------------------------------------------
 embedding_model = HuggingFaceEmbeddings(
     model_name="sentence-transformers/all-MiniLM-L6-v2"
 )
 
-# ===============================
-# LOAD GENERATION MODEL ONCE
-# ===============================
-HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-small")
+# ---------------------------------------------------------------------
+# Generation model (loaded once)
+# ---------------------------------------------------------------------
+HF_GENERATION_MODEL = os.getenv(
+    "HF_GENERATION_MODEL", "google/flan-t5-small"
+)
 
 config = AutoConfig.from_pretrained(HF_GENERATION_MODEL)
 is_encoder_decoder = bool(getattr(config, "is_encoder_decoder", False))
@@ -81,30 +96,31 @@ if torch.cuda.is_available():
 
 model.eval()
 
-# ===============================
-# REQUEST MODELS
-# ===============================
+# ---------------------------------------------------------------------
+# Request models
+# ---------------------------------------------------------------------
 class AskRequest(BaseModel):
     question: str = Field(..., min_length=1)
-    session_ids: list = []
+    session_ids: list[str] = []
 
 
 class SummarizeRequest(BaseModel):
-    session_ids: list = []
+    session_ids: list[str] = []
 
 
 class CompareRequest(BaseModel):
-    session_ids: list = []
+    session_ids: list[str] = []
 
 
-# ===============================
-# UTILITIES
-# ===============================
+# ---------------------------------------------------------------------
+# Utilities
+# ---------------------------------------------------------------------
 def cleanup_expired_sessions():
-    current_time = time.time()
+    now = time.time()
     expired = [
-        sid for sid, data in sessions.items()
-        if current_time - data["last_accessed"] > SESSION_TIMEOUT
+        sid
+        for sid, data in sessions.items()
+        if now - data["last_accessed"] > SESSION_TIMEOUT
     ]
     for sid in expired:
         del sessions[sid]
@@ -112,7 +128,12 @@ def cleanup_expired_sessions():
 
 def generate_response(prompt: str, max_new_tokens: int = 200) -> str:
     device = next(model.parameters()).device
-    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
+    inputs = tokenizer(
+        prompt,
+        return_tensors="pt",
+        truncation=True,
+        max_length=2048,
+    )
     inputs = {k: v.to(device) for k, v in inputs.items()}
 
     output = model.generate(
@@ -131,22 +152,22 @@ def generate_response(prompt: str, max_new_tokens: int = 200) -> str:
     )
 
 
-# ===============================
-# HEALTH ENDPOINTS (kept from enhancement branch)
-# ===============================
+# ---------------------------------------------------------------------
+# Health checks
+# ---------------------------------------------------------------------
 @app.get("/healthz")
-def health_check():
+def healthz():
     return {"status": "healthy"}
 
 
 @app.get("/readyz")
-def readiness_check():
+def readyz():
     return {"status": "ready"}
 
 
-# ===============================
-# UPLOAD (NO AUTH, RETURNS session_id)
-# ===============================
+# ---------------------------------------------------------------------
+# Upload PDF
+# ---------------------------------------------------------------------
 @app.post("/upload")
 @limiter.limit("10/15 minutes")
 async def upload_file(request: Request, file: UploadFile = File(...)):
@@ -159,64 +180,62 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
     file_path = os.path.join(upload_dir, f"{uuid4().hex}_{file.filename}")
 
     try:
-        with open(file_path, "wb") as buffer:
-            buffer.write(await file.read())
+        with open(file_path, "wb") as f:
+            f.write(await file.read())
 
         loader = PyPDFLoader(file_path)
         docs = loader.load()
 
-        # Check if each page has extractable text
         final_docs = []
         images = None
-        
+
         for i, doc in enumerate(docs):
             if len(doc.page_content.strip()) < 50:
-                # Fallback to OCR for this specific page
                 if images is None:
-                    print("Low text content detected on one or more pages. Falling back to OCR...")
-                    images = pdf2image.convert_from_path(file_path)
-                
+                    images = pdf2image.convert_from_path(
+                             file_path, poppler_path=r"C:\Program Files\poppler\Library\bin") # your poppler path
                 if i < len(images):
                     ocr_text = pytesseract.image_to_string(images[i])
-                    final_docs.append(Document(
-                        page_content=ocr_text,
-                        metadata={"source": file_path, "page": i}
-                    ))
+                    final_docs.append(
+                        Document(
+                            page_content=ocr_text,
+                            metadata={"source": file_path, "page": i},
+                        )
+                    )
                 else:
                     final_docs.append(doc)
             else:
                 final_docs.append(doc)
 
-        docs = final_docs
-
         splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=100
+            chunk_size=1000, chunk_overlap=100
         )
-        chunks = splitter.split_documents(docs)
+        chunks = splitter.split_documents(final_docs)
 
         if not chunks:
-            return {"error": "Upload failed: No extractable text found in the document (OCR yielded nothing)."}
+            return {
+                "error": "No extractable text found (OCR yielded nothing)."
+            }
 
         vectorstore = FAISS.from_documents(chunks, embedding_model)
 
         sessions[session_id] = {
             "vectorstores": [vectorstore],
-            "last_accessed": time.time()
+            "last_accessed": time.time(),
         }
 
         return {
             "message": "PDF uploaded and processed",
-            "session_id": session_id
+            "session_id": session_id,
         }
 
     except Exception as e:
         return {"error": f"Upload failed: {str(e)}"}
 
 
-# ===============================
-# ASK (USES session_ids — matches fixed App.js)
-# ===============================
+# ---------------------------------------------------------------------
+# Ask question
+# ---------------------------------------------------------------------
 @app.post("/ask")
 @limiter.limit("60/15 minutes")
 def ask_question(request: Request, data: AskRequest):
@@ -233,7 +252,7 @@ def ask_question(request: Request, data: AskRequest):
             vectorstores.extend(session["vectorstores"])
 
     if not vectorstores:
-        return {"answer": "No documents found for selected sessions."}
+        return {"answer": "No documents found."}
 
     docs = []
     for vs in vectorstores:
@@ -242,22 +261,21 @@ def ask_question(request: Request, data: AskRequest):
     if not docs:
         return {"answer": "No relevant context found."}
 
-    # ── Build minimal prompt via prompt_templates (reduces instruction echoing) ──
+    context = "\n\n".join(d.page_content for d in docs)
+
     prompt = build_ask_prompt(
         context=context,
-        question=question,
-        conversation_context=conversation_context,
+        question=data.question,
     )
 
-    raw_answer = generate_response(prompt, max_new_tokens=150)
-    # Post-process: strip any leaked prompt/context text; return clean answer only.
-    clean_answer = extract_final_answer(raw_answer)
-    return {"answer": clean_answer}
+    raw = generate_response(prompt, max_new_tokens=150)
+    answer = extract_final_answer(raw)
+    return {"answer": answer}
 
 
-# ===============================
-# SUMMARIZE
-# ===============================
+# ---------------------------------------------------------------------
+# Summarize
+# ---------------------------------------------------------------------
 @app.post("/summarize")
 @limiter.limit("15/15 minutes")
 def summarize_pdf(request: Request, data: SummarizeRequest):
@@ -279,20 +297,18 @@ def summarize_pdf(request: Request, data: SummarizeRequest):
     for vs in vectorstores:
         docs.extend(vs.similarity_search("Summarize the document", k=6))
 
-    context = "\n\n".join([d.page_content for d in docs])
+    context = "\n\n".join(d.page_content for d in docs)
 
-    # ── Build minimal summarization prompt ───────────────────────────────────
     prompt = build_summarize_prompt(context=context)
+    raw = generate_response(prompt, max_new_tokens=300)
+    summary = extract_final_summary(raw)
 
-    raw_summary = generate_response(prompt, max_new_tokens=300)
-    # Post-process: strip any leaked prompt/context text from the summary.
-    summary = extract_final_summary(raw_summary)
     return {"summary": summary}
 
 
-# ===============================
-# COMPARE
-# ===============================
+# ---------------------------------------------------------------------
+# Compare documents
+# ---------------------------------------------------------------------
 @app.post("/compare")
 @limiter.limit("10/15 minutes")
 def compare_documents(request: Request, data: CompareRequest):
@@ -301,36 +317,35 @@ def compare_documents(request: Request, data: CompareRequest):
     if len(data.session_ids) < 2:
         return {"comparison": "Select at least 2 documents."}
 
-    contexts = []
+    vectorstores = []
     for sid in data.session_ids:
         session = sessions.get(sid)
         if session:
-            vs = session["vectorstores"][0]
-            chunks = vs.similarity_search("main topics", k=4)
-            text = "\n".join([c.page_content for c in chunks])
-            contexts.append(text)
+            vectorstores.extend(session["vectorstores"])
 
-    # Retrieve top chunks from each document separately for fair comparison
-    query = "summarize the main topic, purpose, and key details of this document"
+    if len(vectorstores) < 2:
+        return {"comparison": "Not enough documents found."}
+
+    query = (
+        "summarize the main topic, purpose, and key details of this document"
+    )
     per_doc_contexts = []
-    for i, vs in enumerate(vectorstores):
+
+    for vs in vectorstores:
         chunks = vs.similarity_search(query, k=4)
-        text = "\n".join([c.page_content for c in chunks])
+        text = "\n".join(c.page_content for c in chunks)
         per_doc_contexts.append(text)
 
-    # ── Build minimal comparison prompt ───────────────────────────────────────
     prompt = build_compare_prompt(per_doc_contexts=per_doc_contexts)
-
     raw = generate_response(prompt, max_new_tokens=400)
-    # Post-process: strip any leaked prompt/context text from the comparison.
     comparison = extract_comparison(raw)
+
     return {"comparison": comparison}
 
 
+# ---------------------------------------------------------------------
+# Simple health
+# ---------------------------------------------------------------------
 @app.get("/health")
 def health():
     return {"status": "ok"}
-
-
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=5000)
