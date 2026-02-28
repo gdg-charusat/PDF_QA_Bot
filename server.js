@@ -95,23 +95,30 @@ app.get("/readyz", async (req, res) => {
 });
 
 
-    const filePath = path.resolve(req.file.path);
-
+app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
+  try {
+    const formData = new FormData();
+    const fileStream = fs.createReadStream(req.file.path);
+  try {
+    const formData = new (require('form-data'))();
+    const fileStream = fs.createReadStream(req.file.path);
+    formData.append("file", fileStream);
+    const realIp = req.headers["x-real-ip"] || req.ip;
     const response = await axios.post(
       `${RAG_URL}/upload`,
-      formData.append("file", fileStream),
+      formData,
       {
-        headers: { "Content-Type": "multipart/form-data" },
+        headers: {
+          ...formData.getHeaders(),
+          "X-Real-IP": realIp
+        },
         timeout: 180000,
       }
     );
-
-    // Store sessionId returned from FastAPI
     if (req.session) {
       req.session.currentSessionId = response.data.session_id;
       req.session.chatHistory = [];
     }
-
     return res.json({
       message: response.data.message,
       session_id: response.data.session_id,
@@ -132,10 +139,14 @@ app.post("/ask", askLimiter, async (req, res) => {
   }
 
   try {
+    const realIp = req.headers["x-real-ip"] || req.ip;
     const response = await axios.post(
       `${RAG_URL}/ask`,
       { question, session_ids },
-      { timeout: 180000 }
+      {
+        timeout: 180000,
+        headers: { "X-Real-IP": realIp }
+      }
     );
 
     return res.json(response.data);
@@ -154,10 +165,14 @@ app.post("/summarize", summarizeLimiter, async (req, res) => {
   }
 
   try {
+    const realIp = req.headers["x-real-ip"] || req.ip;
     const response = await axios.post(
       `${RAG_URL}/summarize`,
       { session_ids },
-      { timeout: 180000 }
+      {
+        timeout: 180000,
+        headers: { "X-Real-IP": realIp }
+      }
     );
 
     return res.json(response.data);
@@ -176,10 +191,14 @@ app.post("/compare", compareLimiter, async (req, res) => {
   }
 
   try {
+    const realIp = req.headers["x-real-ip"] || req.ip;
     const response = await axios.post(
       `${RAG_URL}/compare`,
       { session_ids },
-      { timeout: 180000 }
+      {
+        timeout: 180000,
+        headers: { "X-Real-IP": realIp }
+      }
     );
 
     return res.json(response.data);
