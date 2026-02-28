@@ -167,6 +167,12 @@ export const askQuestionStream = async (question, session_ids, onToken, onCitati
             
             if (data.type === "metadata" && data.citations) {
               onCitations(data.citations);
+            } else if (data.type === "final_answer") {
+              // Final post-processed answer to replace streamed text
+              onToken({
+                type: "final_answer",
+                answer: data.answer,
+              });
             } else if (data.token) {
               onToken(data.token);
             } else if (data.done) {

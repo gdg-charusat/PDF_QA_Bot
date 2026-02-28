@@ -450,8 +450,42 @@ def ask_question_stream(request: Request, data: AskRequest):
         citations.sort(key=lambda c: (c["source"], c["page"]))
         yield f"data: {json.dumps({'citations': citations, 'type': 'metadata'})}\n\n"
 
+        # Stream tokens from LLM generation while accumulating them for post-processing
+        accumulated_tokens = []
         for token_chunk in generate_response_streaming(prompt, max_new_tokens=150):
+            # Pass through the streamed chunk as-is for real-time display
             yield token_chunk
+            
+            # Attempt to parse "data: {...}" SSE chunks to extract tokens
+            try:
+                chunk_str = token_chunk.strip()
+                if chunk_str.startswith("data: "):
+                    payload_str = chunk_str[len("data: "):].strip()
+                    if payload_str:
+                        payload = json.loads(payload_str)
+                        if isinstance(payload, dict) and "token" in payload:
+                            token_text = payload.get("token")
+                            if isinstance(token_text, str):
+                                accumulated_tokens.append(token_text)
+            except Exception:
+                # If parsing fails, skip accumulation but continue streaming
+                pass
+        
+        # After streaming completes, post-process the full answer to strip any
+        # prompt/context leakage and emit a final sanitized answer event.
+        if accumulated_tokens:
+            raw_answer = "".join(accumulated_tokens)
+            try:
+                cleaned_answer = extract_final_answer(raw_answer)
+            except Exception:
+                # If extraction fails, use raw answer
+                cleaned_answer = raw_answer
+            
+            final_event = {
+                "type": "final_answer",
+                "answer": cleaned_answer,
+            }
+            yield f"data: {json.dumps(final_event)}\n\n"
 
     return StreamingResponse(generate(), media_type="text/event-stream")
 

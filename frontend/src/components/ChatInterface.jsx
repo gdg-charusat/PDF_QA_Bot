@@ -45,15 +45,28 @@ const ChatInterface = ({
           questionText,
           selectedDocIds.length > 0 ? [sessionId] : [],
           (token) => {
-            // Accumulate tokens
-            fullAnswer += token;
-            // Update chat incrementally as tokens arrive (streaming effect)
-            onChatUpdate({
-              role: "bot",
-              text: fullAnswer,
-              isStreaming: true,
-              citations: citations,
-            });
+            // Handle final post-processed answer
+            if (typeof token === "object" && token.type === "final_answer") {
+              fullAnswer = token.answer;
+              // Replace streamed text with cleaned answer (context leakage stripped)
+              onChatUpdate({
+                role: "bot",
+                text: fullAnswer,
+                isStreaming: false,
+                citations: citations,
+                isCleaned: true,
+              });
+            } else if (typeof token === "string") {
+              // Accumulate individual tokens for real-time display
+              fullAnswer += token;
+              // Update chat incrementally as tokens arrive (streaming effect)
+              onChatUpdate({
+                role: "bot",
+                text: fullAnswer,
+                isStreaming: true,
+                citations: citations,
+              });
+            }
           },
           (newCitations) => {
             // Update citations when they arrive
