@@ -245,8 +245,39 @@ def _clean(
     # ── Step 7: Strip stray leading marker (model echoed it again) ───────────
     raw = leading_marker_re.sub("", raw).strip()
 
-    # ── Step 8: Safe fallback ─────────────────────────────────────────────────
+    # ── Step 8: Context-dump detection ───────────────────────────────────────
+    # When flan-t5-base can't answer it copies the PDF context verbatim.
+    # Those lines survive all echo filters (they are real document content,
+    # not instruction text).  Detect them here and return empty string so
+    # ``extract_typed_answer`` in query_utils can extract the right value
+    # directly from the context using regex.
+    #
+    # Signals of a context dump:
+    #   • More than 20 words with ZERO sentence-ending punctuation
+    #   • Contains known certificate / transcript metadata patterns
+    #   • More than 30 words total (a direct answer must be brief)
+    _CONTEXT_DUMP_METADATA = re.compile(
+        r'NPTEL\d+[A-Z0-9]+'         # e.g. NPTEL25CS23S334600098
+        r'|Roll\s+No'                # "Roll No"
+        r'|To verify.*certificate'   # certificate verification phrase
+        r'|No\.\s*of\s*credits'      # "No. of credits recommended"
+        r'|recommended\s*:\s*\d',    # "recommended: 2 or 3"
+        re.IGNORECASE,
+    )
+    if raw:
+        word_count = len(raw.split())
+        sentence_endings = len(re.findall(r'[.!?]', raw))
+        _is_dump = (
+            word_count > 30
+            or (word_count > 15 and sentence_endings == 0)
+            or bool(_CONTEXT_DUMP_METADATA.search(raw))
+        )
+        if _is_dump:
+            raw = ""   # hand off to extract_typed_answer for regex extraction
+
+    # ── Step 9: Safe fallback ─────────────────────────────────────────────────
     return raw if raw else fallback
+
 
 
 # ---------------------------------------------------------------------------

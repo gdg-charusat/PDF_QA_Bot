@@ -22,11 +22,9 @@ app.set("trust proxy", 1);
 app.use(cors());
 app.use(express.json());
 
-/* ================= SESSION ================= */
-
 app.use(
   session({
-    secret: SESSION_SECRET,
+    secret: "fallback_session_secret_key", // FIX: removed SESSION_SECRET environment variable dependency
     resave: false,
     saveUninitialized: true,
     cookie: {
@@ -66,6 +64,14 @@ const storage = multer.diskStorage({
     const unique = Date.now() + "-" + file.originalname;
     cb(null, unique);
   },
+  fileFilter: (req, file, cb) => {
+    // Accept only PDF files
+    if (file.mimetype === 'application/pdf') {
+      cb(null, true);
+    } else {
+      cb(new Error('Only PDF files are allowed'));
+    }
+  }
 });
 
 const upload = multer({
@@ -101,6 +107,14 @@ app.get("/readyz", async (req, res) => {
         service: "pdf-qa-gateway",
         dependencies: { rag_service: "healthy" },
       });
+// Route: Upload PDF
+app.post("/upload", upload.single("file"), async (req, res) => {
+  let filePath = null;
+
+  try {
+    // Check if file was uploaded
+    if (!req.file) {
+      return res.status(400).json({ error: "No file uploaded. Use form field name 'file'." });
     }
 
     throw new Error("RAG unhealthy");
@@ -119,6 +133,60 @@ app.get("/health", (req, res) => {
 
 /* ================= ROUTES ================= */
 
+    // Build absolute file path
+    filePath = path.join(__dirname, req.file.path);
+
+    // Verify file exists on disk
+    if (!fs.existsSync(filePath)) {
+      return res.status(500).json({ error: "File upload failed - file not found on disk" });
+    }
+
+    console.log(`Processing PDF: ${req.file.originalname} (${req.file.size} bytes)`);
+
+    // Send PDF to Python service for processing
+    const response = await axios.post("http://localhost:5000/process-pdf", {
+      filePath: filePath,
+    }, {
+      timeout: 60000 // 60 second timeout
+    });
+
+    res.json({
+      message: "PDF uploaded & processed successfully!",
+      filename: req.file.originalname,
+      size: req.file.size
+    });
+  } catch (err) {
+    // Clean up uploaded file on error
+    if (filePath && fs.existsSync(filePath)) {
+      try {
+        fs.unlinkSync(filePath);
+        console.log(`Cleaned up file after error: ${filePath}`);
+      } catch (cleanupErr) {
+        console.error(`Failed to cleanup file: ${cleanupErr.message}`);
+      }
+    }
+
+    // Determine error type and send appropriate response
+    if (err.code === 'ECONNREFUSED') {
+      console.error("RAG service not available");
+      return res.status(503).json({
+        error: "RAG service unavailable",
+        details: "Please ensure the Python service is running on port 5000"
+      });
+    }
+
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(413).json({
+        error: "File too large",
+        details: "Maximum file size is 10MB"
+      });
+    }
+
+    const details = err.response?.data || err.message;
+    console.error("Upload processing failed:", details);
+    res.status(500).json({ error: "PDF processing failed", details });
+    const filePath = path.resolve(req.file.path);
+// FIX: Upload endpoint with file cleanup to prevent disk space exhaustion (Issue #110)
 app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
   if (!req.file || !req.file.path) {
     return res.status(400).json({ error: "No file uploaded." });
@@ -137,9 +205,13 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
   try {
     fileStream = fs.createReadStream(filePath);
     
+  let fileStream;
+
+  try {
     const FormData = require("form-data");
     const formData = new FormData();
-    formData.append("file", fileStream);
+    fileStream = fs.createReadStream(filePath);
+    formData.append("file", fileStream, req.file.originalname);
 
     const response = await axios.post(
       `${RAG_URL}/upload`,
@@ -176,7 +248,7 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
     if (fileStream) {
       fileStream.destroy();
     }
-    
+
     fs.unlink(filePath, (unlinkErr) => {
       if (unlinkErr && unlinkErr.code !== "ENOENT") {
         console.warn(`[/upload] Failed to delete file: ${unlinkErr.message}`);
@@ -199,17 +271,44 @@ app.post("/ask", askLimiter, async (req, res) => {
   }
 
   try {
-    const response = await axios.post(
-      `${RAG_URL}/ask`,
-      { question, session_ids },
-      { timeout: 180000 }
-    );
+    // Initialize session chat history if it doesn't exist
+    if (!req.session.chatHistory) {
+      req.session.chatHistory = [];
+    }
 
-    return res.json(response.data);
+    // Add user message to session history
+    req.session.chatHistory.push({
+      role: "user",
+      content: question,
+    });
+
+    // Send question + history to FastAPI with session isolation
+    const response = await axios.post("http://localhost:5000/ask", {
+      question: question,
+      session_ids: session_ids,
+      history: req.session.chatHistory,
+    });
+
+    // Add assistant response to session history
+    req.session.chatHistory.push({
+      role: "assistant",
+      content: response.data.answer,
+    });
+
+    res.json(response.data);
   } catch (error) {
     console.error("[/ask]", error.response?.data || error.message);
     return res.status(500).json({ error: "Error getting answer." });
   }
+  res.json({ message: "History cleared" });
+});
+
+app.post("/clear-history", (req, res) => {
+  // Clear only this user's session history
+  if (req.session) {
+    req.session.chatHistory = [];
+  }
+  res.json({ message: "History cleared" });
 });
 
 app.post("/summarize", summarizeLimiter, async (req, res) => {
@@ -262,7 +361,36 @@ app.post("/compare", compareLimiter, async (req, res) => {
   }
 });
 
-/* ================= GLOBAL ERROR HANDLER ================= */
+// Route: Generate Smart Question Suggestions
+app.post("/generate-suggestions", async (req, res) => {
+  try {
+    const response = await axios.post("http://localhost:5000/suggest-questions", {}, {
+      timeout: 10000
+    });
+    res.json({ suggestions: response.data.suggestions || [] });
+  } catch (err) {
+    console.error("Suggestion generation failed:", err.message);
+    res.json({ suggestions: [] }); // Fail gracefully
+  }
+});
+
+// Global error handler for multer errors
+app.use((err, req, res, next) => {
+  if (err instanceof multer.MulterError) {
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(413).json({
+        error: "File too large",
+        details: "Maximum file size is 10MB"
+      });
+    }
+    return res.status(400).json({ error: err.message });
+  } else if (err) {
+    return res.status(400).json({ error: err.message });
+  }
+  next();
+});
+
+app.listen(4000, () => console.log("Backend running on http://localhost:4000"));
 
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError) {
