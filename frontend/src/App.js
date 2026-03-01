@@ -25,13 +25,7 @@ function App() {
   const [numPages, setNumPages] = useState(null);
   const [pageNumber, setPageNumber] = useState(1);
   const [summarizing, setSummarizing] = useState(false);
-  const [suggestions, setSuggestions] = useState([]);
-  const [loadingSuggestions, setLoadingSuggestions] = useState(false);
 
-  // Clear suggestions when switching PDFs
-  useEffect(() => {
-    setSuggestions([]);
-  }, [selectedPdf]);
   const [sessionId, setSessionId] = useState(() => {
     return localStorage.getItem(SESSION_ID_KEY) || "";
   });
@@ -73,7 +67,6 @@ function App() {
   const uploadPDF = async () => {
     if (!file || !sessionId) return;
     setUploading(true);
-    setSuggestions([]); // Clear previous suggestions
     const formData = new FormData();
     formData.append("file", file);
     formData.append("sessionId", sessionId);
@@ -84,17 +77,6 @@ function App() {
       setPdfs(prev => [...prev, { name: file.name, url, chat: [] }]);
       setSelectedPdf(file.name);
       alert("PDF uploaded!");
-      
-      // Generate smart suggestions
-      setLoadingSuggestions(true);
-      try {
-        const suggestionsRes = await axios.post(`${API_BASE}/generate-suggestions`);
-        setSuggestions(suggestionsRes.data.suggestions || []);
-      } catch (sugErr) {
-        console.error("Failed to generate suggestions:", sugErr);
-        setSuggestions([]);
-      }
-      setLoadingSuggestions(false);
     } catch (e) {
       console.error(e);
       alert("Upload failed. Ensure the server and RAG service are running.");
@@ -262,31 +244,7 @@ function App() {
                     </div>
                   ))}
                 </div>
-                {/* Smart Question Suggestions */}
-                {loadingSuggestions && (
-                  <div className="mb-2 text-center">
-                    <Spinner animation="border" size="sm" className="me-2" />
-                    <span>Generating suggestions...</span>
-                  </div>
-                )}
-                {!loadingSuggestions && suggestions.length > 0 && (
-                  <div className="mb-3">
-                    <small className="text-muted">💡 Suggested questions:</small>
-                    <div className="d-flex flex-wrap gap-2 mt-2">
-                      {suggestions.map((q, idx) => (
-                        <Button
-                          key={idx}
-                          variant="outline-info"
-                          size="sm"
-                          onClick={() => setQuestion(q)}
-                          style={{ textAlign: 'left', whiteSpace: 'normal' }}
-                        >
-                          {q}
-                        </Button>
-                      ))}
-                    </div>
-                  </div>
-                )}
+                {/* Smart Question Suggestions removed — endpoint /generate-suggestions was calling a deleted FastAPI route */}
                 <Form className="d-flex gap-2 mb-2">
                   <Form.Control
                     type="text"

@@ -43,7 +43,7 @@ const ChatInterface = ({
 
         await askQuestionStream(
           questionText,
-          selectedDocIds.length > 0 ? [sessionId] : [],
+          selectedDocIds.length > 0 ? selectedDocIds : [],
           (token) => {
             // Handle final post-processed answer
             if (typeof token === "object" && token.type === "final_answer") {

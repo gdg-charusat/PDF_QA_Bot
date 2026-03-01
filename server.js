@@ -95,18 +95,30 @@ app.get("/readyz", async (req, res) => {
 });
 
 
-    const filePath = path.resolve(req.file.path);
+// Route: Upload PDF and proxy to RAG service
+app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
+  if (!req.file || !req.file.path) {
+    return res.status(400).json({ error: "No file uploaded." });
+  }
+
+  const filePath = path.resolve(req.file.path);
+  let fileStream;
+
+  try {
+    const FormData = require("form-data");
+    const formData = new FormData();
+    fileStream = fs.createReadStream(filePath);
+    formData.append("file", fileStream, req.file.originalname);
 
     const response = await axios.post(
       `${RAG_URL}/upload`,
-      formData.append("file", fileStream),
+      formData,
       {
-        headers: { "Content-Type": "multipart/form-data" },
+        headers: formData.getHeaders(),
         timeout: 180000,
       }
     );
 
-    // Store sessionId returned from FastAPI
     if (req.session) {
       req.session.currentSessionId = response.data.session_id;
       req.session.chatHistory = [];
@@ -119,6 +131,13 @@ app.get("/readyz", async (req, res) => {
   } catch (err) {
     console.error("[/upload]", err.response?.data || err.message);
     return res.status(500).json({ error: "Upload failed." });
+  } finally {
+    if (fileStream) fileStream.destroy();
+    fs.unlink(filePath, (unlinkErr) => {
+      if (unlinkErr && unlinkErr.code !== "ENOENT") {
+        console.warn(`[/upload] Failed to delete temp file: ${unlinkErr.message}`);
+      }
+    });
   }
 });
 
