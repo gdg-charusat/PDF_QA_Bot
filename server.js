@@ -100,14 +100,6 @@ app.get("/readyz", async (req, res) => {
         service: "pdf-qa-gateway",
         dependencies: { rag_service: "healthy" },
       });
-// Route: Upload PDF
-app.post("/upload", upload.single("file"), async (req, res) => {
-  let filePath = null;
-
-  try {
-    // Check if file was uploaded
-    if (!req.file) {
-      return res.status(400).json({ error: "No file uploaded. Use form field name 'file'." });
     }
 
     throw new Error("RAG unhealthy");
@@ -126,60 +118,6 @@ app.get("/health", (req, res) => {
 
 /* ================= ROUTES ================= */
 
-    // Build absolute file path
-    filePath = path.join(__dirname, req.file.path);
-
-    // Verify file exists on disk
-    if (!fs.existsSync(filePath)) {
-      return res.status(500).json({ error: "File upload failed - file not found on disk" });
-    }
-
-    console.log(`Processing PDF: ${req.file.originalname} (${req.file.size} bytes)`);
-
-    // Send PDF to Python service for processing
-    const response = await axios.post("http://localhost:5000/process-pdf", {
-      filePath: filePath,
-    }, {
-      timeout: 60000 // 60 second timeout
-    });
-
-    res.json({
-      message: "PDF uploaded & processed successfully!",
-      filename: req.file.originalname,
-      size: req.file.size
-    });
-  } catch (err) {
-    // Clean up uploaded file on error
-    if (filePath && fs.existsSync(filePath)) {
-      try {
-        fs.unlinkSync(filePath);
-        console.log(`Cleaned up file after error: ${filePath}`);
-      } catch (cleanupErr) {
-        console.error(`Failed to cleanup file: ${cleanupErr.message}`);
-      }
-    }
-
-    // Determine error type and send appropriate response
-    if (err.code === 'ECONNREFUSED') {
-      console.error("RAG service not available");
-      return res.status(503).json({
-        error: "RAG service unavailable",
-        details: "Please ensure the Python service is running on port 5000"
-      });
-    }
-
-    if (err.code === 'LIMIT_FILE_SIZE') {
-      return res.status(413).json({
-        error: "File too large",
-        details: "Maximum file size is 10MB"
-      });
-    }
-
-    const details = err.response?.data || err.message;
-    console.error("Upload processing failed:", details);
-    res.status(500).json({ error: "PDF processing failed", details });
-    const filePath = path.resolve(req.file.path);
-// FIX: Upload endpoint with file cleanup to prevent disk space exhaustion (Issue #110)
 app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
   if (!req.file || !req.file.path) {
     return res.status(400).json({ error: "No file uploaded." });
@@ -193,11 +131,6 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
     return res.status(400).json({ error: "Invalid file path." });
   }
 
-  let fileStream;
-
-  try {
-    fileStream = fs.createReadStream(filePath);
-    
   let fileStream;
 
   try {
@@ -241,7 +174,7 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
     if (fileStream) {
       fileStream.destroy();
     }
-
+    
     fs.unlink(filePath, (unlinkErr) => {
       if (unlinkErr && unlinkErr.code !== "ENOENT") {
         console.warn(`[/upload] Failed to delete file: ${unlinkErr.message}`);
@@ -249,7 +182,6 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
     });
   }
 });
-
 
 app.post("/ask", askLimiter, async (req, res) => {
   const { question, session_ids } = req.body;
@@ -264,44 +196,17 @@ app.post("/ask", askLimiter, async (req, res) => {
   }
 
   try {
-    // Initialize session chat history if it doesn't exist
-    if (!req.session.chatHistory) {
-      req.session.chatHistory = [];
-    }
+    const response = await axios.post(
+      `${RAG_URL}/ask`,
+      { question, session_ids },
+      { timeout: 180000 }
+    );
 
-    // Add user message to session history
-    req.session.chatHistory.push({
-      role: "user",
-      content: question,
-    });
-
-    // Send question + history to FastAPI with session isolation
-    const response = await axios.post("http://localhost:5000/ask", {
-      question: question,
-      session_ids: session_ids,
-      history: req.session.chatHistory,
-    });
-
-    // Add assistant response to session history
-    req.session.chatHistory.push({
-      role: "assistant",
-      content: response.data.answer,
-    });
-
-    res.json(response.data);
+    return res.json(response.data);
   } catch (error) {
     console.error("[/ask]", error.response?.data || error.message);
     return res.status(500).json({ error: "Error getting answer." });
   }
-  res.json({ message: "History cleared" });
-});
-
-app.post("/clear-history", (req, res) => {
-  // Clear only this user's session history
-  if (req.session) {
-    req.session.chatHistory = [];
-  }
-  res.json({ message: "History cleared" });
 });
 
 app.post("/summarize", summarizeLimiter, async (req, res) => {
@@ -354,12 +259,27 @@ app.post("/compare", compareLimiter, async (req, res) => {
   }
 });
 
-// Route: Generate Smart Question Suggestions
+app.post("/clear-history", (req, res) => {
+  if (req.session) {
+    req.session.chatHistory = [];
+  }
+  res.json({ message: "History cleared." });
+});
+
 app.post("/generate-suggestions", async (req, res) => {
+  const { session_ids } = req.body;
+
+  if (!session_ids || session_ids.length === 0) {
+    return res.json({ suggestions: [] });
+  }
+
   try {
-    const response = await axios.post("http://localhost:5000/suggest-questions", {}, {
-      timeout: 10000
-    });
+    const response = await axios.post(
+      `${RAG_URL}/generate-suggestions`,
+      { session_ids },
+      { timeout: 60000 }
+    );
+    
     res.json({ suggestions: response.data.suggestions || [] });
   } catch (err) {
     console.error("Suggestion generation failed:", err.message);
