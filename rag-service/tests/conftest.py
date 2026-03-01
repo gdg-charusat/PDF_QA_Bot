@@ -131,45 +131,73 @@ def admin_headers(admin_token):
 
 @pytest.fixture
 def test_pdf_file():
-    """Create a temporary PDF file for testing"""
+    """Create a temporary PDF file with real extractable text for testing.
+
+    The PDF is built from raw bytes with a content stream so that PyPDFLoader
+    can extract text and FAISS can index it.
+    """
+
+    def _build_pdf() -> bytes:
+        """Return bytes of a minimal but valid PDF with extractable text."""
+        body_text = (
+            b"This is a sample PDF document created for automated testing. "
+            b"It contains enough extractable text so that PyPDFLoader can "
+            b"parse it, LangChain can split it into chunks, and FAISS can "
+            b"build a non-empty vector store from those chunks. "
+            b"Session isolation tests rely on at least one document chunk "
+            b"being present so that similarity_search returns results."
+        )
+        stream_content = (
+            b"BT\n/F1 12 Tf\n50 750 Td\n("
+            + body_text
+            + b") Tj\nET\n"
+        )
+        stream_len = len(stream_content)
+
+        # --- assemble object bodies (no offsets yet) ---
+        raw = {
+            1: b"<</Type /Catalog /Pages 2 0 R>>",
+            2: b"<</Type /Pages /Kids [3 0 R] /Count 1>>",
+            # Page references content stream (4) and font resource (5)
+            3: (
+                b"<</Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]"
+                b" /Contents 4 0 R"
+                b" /Resources <</Font <</F1 5 0 R>>>>>>"
+            ),
+            4: (
+                b"<</Length "
+                + str(stream_len).encode()
+                + b">>\nstream\n"
+                + stream_content
+                + b"\nendstream"
+            ),
+            5: (
+                b"<</Type /Font /Subtype /Type1 /BaseFont /Helvetica"
+                b" /Encoding /WinAnsiEncoding>>"
+            ),
+        }
+
+        header = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n"
+        buf = bytearray(header)
+        offsets: dict[int, int] = {}
+        for n in range(1, 6):
+            offsets[n] = len(buf)
+            buf += (str(n).encode() + b" 0 obj\n" + raw[n] + b"\nendobj\n")
+
+        xref_offset = len(buf)
+        xref = b"xref\n0 6\n" + b"0000000000 65535 f \n"
+        for n in range(1, 6):
+            xref += ("%010d 00000 n \n" % offsets[n]).encode()
+
+        trailer = (
+            b"trailer\n<</Size 6 /Root 1 0 R>>\nstartxref\n"
+            + str(xref_offset).encode()
+            + b"\n%%EOF\n"
+        )
+        return bytes(buf) + xref + trailer
+
     with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as f:
-        # Create a minimal PDF content (this is just for testing file upload)
-        pdf_content = b"""%PDF-1.4
-1 0 obj
-<<
-/Type /Catalog
-/Pages 2 0 R
->>
-endobj
-2 0 obj
-<<
-/Type /Pages
-/Kids [3 0 R]
-/Count 1
->>
-endobj  
-3 0 obj
-<<
-/Type /Page
-/Parent 2 0 R
-/MediaBox [0 0 612 792]
->>
-endobj
-xref
-0 4
-0000000000 65535 f 
-0000000009 00000 n 
-0000000058 00000 n 
-0000000115 00000 n 
-trailer
-<<
-/Size 4
-/Root 1 0 R
->>
-startxref
-179
-%%EOF"""
-        f.write(pdf_content)
+        f.write(_build_pdf())
         f.flush()
         yield f.name
     os.unlink(f.name)
