@@ -16,6 +16,15 @@ All builders follow the same contract:
     post-processor can split on it reliably.
   • Never include multi-sentence bullet-point rules inside the prompt — those
     are the primary source of echoed instruction text.
+
+IMPORTANT — Why answer_type_hint was removed from build_ask_prompt
+------------------------------------------------------------------
+An earlier version injected a format hint into the prompt, e.g.:
+  "Answer the question … Be brief. Look for a value ending with the % symbol."
+Testing proved that flan-t5-base treats this literally and outputs only the
+symbol it was told to look for (bare "%" or bare "$").
+Numeric disambiguation now happens AFTER generation in
+``query_utils.extract_typed_answer`` using regex on the raw context.
 """
 
 __all__ = ["build_ask_prompt", "build_summarize_prompt", "build_compare_prompt"]
@@ -40,7 +49,11 @@ def _truncate(text: str, max_chars: int) -> str:
 # Public builders
 # ---------------------------------------------------------------------------
 
-def build_ask_prompt(context: str, question: str, conversation_context: str = "") -> str:
+def build_ask_prompt(
+    context: str,
+    question: str,
+    conversation_context: str = "",
+) -> str:
     """
     Build the minimal QA prompt.
 
@@ -57,11 +70,19 @@ def build_ask_prompt(context: str, question: str, conversation_context: str = ""
     -------
     str
         A compact prompt string ready to pass to the generation model.
+
+    Notes
+    -----
+    Deliberately kept to ONE plain instruction sentence with NO format hints.
+    Injecting hints like "look for a % value" caused flan-t5-base to echo the
+    hint symbol literally (e.g. outputting bare "%").
+    Numeric / typed-answer disambiguation is handled AFTER generation by
+    ``query_utils.extract_typed_answer``.
     """
-    ctx = _truncate(context, _MAX_CONTEXT_CHARS)
+    ctx  = _truncate(context, _MAX_CONTEXT_CHARS)
     conv = _truncate(conversation_context.strip(), _MAX_CONV_CHARS) if conversation_context.strip() else ""
 
-    # Minimal instruction sentence — one line only, no bullet points.
+    # One plain instruction line — no format hints, no bullet points.
     instruction = "Answer the question using only the document below. Be brief and direct."
 
     parts = [instruction, ""]
