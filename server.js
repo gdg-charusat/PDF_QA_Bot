@@ -24,7 +24,7 @@ app.use(express.json());
 
 app.use(
   session({
-    secret: "fallback_session_secret_key", // FIX: removed SESSION_SECRET environment variable dependency
+    secret: SESSION_SECRET,
     resave: false,
     saveUninitialized: true,
     cookie: {
@@ -64,14 +64,6 @@ const storage = multer.diskStorage({
     const unique = Date.now() + "-" + file.originalname;
     cb(null, unique);
   },
-  fileFilter: (req, file, cb) => {
-    // Accept only PDF files
-    if (file.mimetype === 'application/pdf') {
-      cb(null, true);
-    } else {
-      cb(new Error('Only PDF files are allowed'));
-    }
-  }
 });
 
 const upload = multer({
@@ -374,23 +366,7 @@ app.post("/generate-suggestions", async (req, res) => {
   }
 });
 
-// Global error handler for multer errors
-app.use((err, req, res, next) => {
-  if (err instanceof multer.MulterError) {
-    if (err.code === 'LIMIT_FILE_SIZE') {
-      return res.status(413).json({
-        error: "File too large",
-        details: "Maximum file size is 10MB"
-      });
-    }
-    return res.status(400).json({ error: err.message });
-  } else if (err) {
-    return res.status(400).json({ error: err.message });
-  }
-  next();
-});
-
-app.listen(4000, () => console.log("Backend running on http://localhost:4000"));
+/* ================= GLOBAL ERROR HANDLER ================= */
 
 app.use((err, req, res, next) => {
   if (err instanceof multer.MulterError) {
@@ -401,7 +377,7 @@ app.use((err, req, res, next) => {
     }
     return res.status(400).json({ error: err.message });
   } else if (err) {
-    return res.status(400).json({ error: err.message });
+    return res.status(500).json({ error: err.message });
   }
   next();
 });
