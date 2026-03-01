@@ -3,98 +3,149 @@ const FormData = require('form-data');
 const fs = require('fs');
 const path = require('path');
 
-const API_BASE = 'http://localhost:4000';
+const API_BASE = process.env.API_BASE || 'http://localhost:4000';
+
+let passed = 0;
+let failed = 0;
+const tempFiles = [];
+
+function pass(name) {
+    passed++;
+    console.log(`  ✅ ${name}`);
+}
+
+function fail(name, detail) {
+    failed++;
+    console.log(`  ❌ ${name}: ${detail}`);
+}
+
+function tmpFile(name) {
+    const p = path.join(__dirname, name);
+    tempFiles.push(p);
+    return p;
+}
+
+function cleanup() {
+    tempFiles.forEach(p => {
+        try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch (_) { /* ignore */ }
+    });
+}
 
 /**
- * Test suite for PDF upload validation
- * Tests: file type validation, extension checking, and 20MB size limit
+ * Integration tests for the /upload endpoint.
+ *
+ * Validates:
+ *  1. Valid PDF is accepted
+ *  2. Wrong extension (.txt) is rejected with 400
+ *  3. Spoofed MIME (plain-text content in a .pdf) is rejected with 400
+ *  4. File exceeding 20 MB limit is rejected with 400
+ *  5. Missing file field is rejected with 400
+ *
+ * Requires the server to be running on API_BASE (default http://localhost:4000).
  */
 async function testValidation() {
-    console.log('--- Testing File Validation ---');
+    console.log('--- PDF Upload Validation Tests ---\n');
 
-    // 1. Test valid PDF (assuming we have one or create a dummy)
-    console.log('\nTesting valid PDF upload...');
-    const dummyPdfPath = path.join(__dirname, 'test_dummy.pdf');
+    // 1. Valid PDF upload
+    console.log('Test 1: Valid PDF upload');
+    const dummyPdfPath = tmpFile('test_dummy.pdf');
     fs.writeFileSync(dummyPdfPath, '%PDF-1.4\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF');
-
     try {
         const form = new FormData();
         form.append('file', fs.createReadStream(dummyPdfPath));
-        const response = await axios.post(`${API_BASE}/upload`, form, {
+        const res = await axios.post(`${API_BASE}/upload`, form, {
             headers: form.getHeaders(),
         });
-        console.log('✅ Valid PDF: Success (Status', response.status, ')');
+        if (res.status === 200 && res.data.session_id) {
+            pass('Valid PDF accepted (200)');
+        } else {
+            fail('Valid PDF', `Unexpected status ${res.status}`);
+        }
     } catch (err) {
-        console.log('❌ Valid PDF: Failed (Status', err.response?.status, ')');
-        console.log('Response:', err.response?.data);
+        fail('Valid PDF', `Server responded ${err.response?.status || err.code}: ${JSON.stringify(err.response?.data)}`);
     }
 
-    // 2. Test invalid extension (.txt)
-    console.log('\nTesting invalid extension (.txt)...');
-    const txtPath = path.join(__dirname, 'test.txt');
+    // 2. Invalid extension (.txt)
+    console.log('Test 2: Invalid extension (.txt)');
+    const txtPath = tmpFile('test.txt');
     fs.writeFileSync(txtPath, 'This is a text file');
     try {
         const form = new FormData();
         form.append('file', fs.createReadStream(txtPath));
-        await axios.post(`${API_BASE}/upload`, form, {
-            headers: form.getHeaders(),
-        });
-        console.log('❌ Invalid extension: Failed to catch!');
+        await axios.post(`${API_BASE}/upload`, form, { headers: form.getHeaders() });
+        fail('Invalid extension', 'Server did not reject the file');
     } catch (err) {
-        if (err.response?.status === 400 && err.response?.data?.error === 'Invalid file type. Only PDF files are accepted.') {
-            console.log('✅ Invalid extension: Caught correctly (Status 400)');
+        if (err.response?.status === 400 &&
+            err.response.data.error === 'Invalid file type. Only PDF files are accepted.') {
+            pass('Invalid extension rejected (400)');
         } else {
-            console.log('❌ Invalid extension: Unexpected response (Status', err.response?.status, ')');
-            console.log('Response:', err.response?.data);
+            fail('Invalid extension', `Got ${err.response?.status}: ${JSON.stringify(err.response?.data)}`);
         }
     }
 
-    // 3. Test spoofed extension (txt renamed to .pdf)
-    console.log('\nTesting spoofed extension (txt renamed to .pdf)...');
-    const spoofedPath = path.join(__dirname, 'spoofed.pdf');
+    // 3. Spoofed extension (plain-text content in a .pdf file)
+    console.log('Test 3: Spoofed MIME (.pdf extension, text content)');
+    const spoofedPath = tmpFile('spoofed.pdf');
     fs.writeFileSync(spoofedPath, 'This is a text file labeled as PDF');
     try {
         const form = new FormData();
         form.append('file', fs.createReadStream(spoofedPath));
-        await axios.post(`${API_BASE}/upload`, form, {
-            headers: form.getHeaders(),
-        });
-        console.log('❌ Spoofed extension: Failed to catch!');
+        await axios.post(`${API_BASE}/upload`, form, { headers: form.getHeaders() });
+        fail('Spoofed extension', 'Server did not reject the file');
     } catch (err) {
-        if (err.response?.status === 400 && err.response?.data?.error === 'Invalid file type. Only PDF files are accepted.') {
-            console.log('✅ Spoofed extension: Caught correctly (Status 400)');
+        if (err.response?.status === 400 &&
+            err.response.data.error === 'Invalid file type. Only PDF files are accepted.') {
+            pass('Spoofed extension rejected (400)');
         } else {
-            console.log('❌ Spoofed extension: Unexpected response (Status', err.response?.status, ')');
-            console.log('Response:', err.response?.data);
+            fail('Spoofed extension', `Got ${err.response?.status}: ${JSON.stringify(err.response?.data)}`);
         }
     }
 
-    // 4. Test oversized file
-    console.log('\nTesting oversized file ( > 20MB)...');
-    const oversizedPath = path.join(__dirname, 'oversized.pdf');
-    const buffer = Buffer.alloc(21 * 1024 * 1024); // 21MB
-    buffer.write('%PDF-1.4\n');
-    fs.writeFileSync(oversizedPath, buffer);
+    // 4. Oversized file (> 20 MB)
+    console.log('Test 4: Oversized file (21 MB)');
+    const oversizedPath = tmpFile('oversized.pdf');
+    const buf = Buffer.alloc(21 * 1024 * 1024); // 21 MB
+    buf.write('%PDF-1.4\n');
+    fs.writeFileSync(oversizedPath, buf);
     try {
         const form = new FormData();
         form.append('file', fs.createReadStream(oversizedPath));
-        await axios.post(`${API_BASE}/upload`, form, {
-            headers: form.getHeaders(),
-        });
-        console.log('❌ Oversized file: Failed to catch!');
+        await axios.post(`${API_BASE}/upload`, form, { headers: form.getHeaders() });
+        fail('Oversized file', 'Server did not reject the file');
     } catch (err) {
-        if (err.response?.status === 400 && err.response?.data?.error === 'File too large. Maximum allowed size is 20MB.') {
-            console.log('✅ Oversized file: Caught correctly (Status 400)');
+        if (err.response?.status === 400 &&
+            err.response.data.error === 'File too large. Maximum allowed size is 20MB.') {
+            pass('Oversized file rejected (400)');
         } else {
-            console.log('❌ Oversized file: Unexpected response (Status', err.response?.status, ')');
-            console.log('Response:', err.response?.data);
+            fail('Oversized file', `Got ${err.response?.status}: ${JSON.stringify(err.response?.data)}`);
         }
     }
 
-    // Cleanup
-    [dummyPdfPath, txtPath, spoofedPath, oversizedPath].forEach(p => {
-        if (fs.existsSync(p)) fs.unlinkSync(p);
-    });
+    // 5. Missing file field
+    console.log('Test 5: Missing file field');
+    try {
+        await axios.post(`${API_BASE}/upload`, {}, {
+            headers: { 'Content-Type': 'application/json' },
+        });
+        fail('Missing file', 'Server did not reject the request');
+    } catch (err) {
+        if (err.response?.status === 400) {
+            pass('Missing file rejected (400)');
+        } else {
+            fail('Missing file', `Got ${err.response?.status}: ${JSON.stringify(err.response?.data)}`);
+        }
+    }
 }
 
-testValidation();
+// Run and report
+testValidation()
+    .then(() => {
+        cleanup();
+        console.log(`\n--- Results: ${passed} passed, ${failed} failed ---`);
+        process.exit(failed > 0 ? 1 : 0);
+    })
+    .catch((err) => {
+        cleanup();
+        console.error('\nTest suite crashed:', err.message);
+        process.exit(1);
+    });

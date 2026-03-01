@@ -6,6 +6,7 @@ const fs = require("fs");
 const path = require("path");
 const rateLimit = require("express-rate-limit");
 const session = require("express-session");
+const FormData = require("form-data");
 require("dotenv").config();
 
 const app = express();
@@ -125,19 +126,15 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
 
   const filePath = path.resolve(req.file.path);
   const uploadDirResolved = path.resolve(UPLOAD_DIR);
-  
+
   if (!filePath.startsWith(uploadDirResolved + path.sep) && filePath !== uploadDirResolved) {
     console.error("[/upload] Path traversal attempt detected:", filePath);
     return res.status(400).json({ error: "Invalid file path." });
   }
 
-  let fileStream;
-
   try {
-    const FormData = require("form-data");
     const formData = new FormData();
-    fileStream = fs.createReadStream(filePath);
-    formData.append("file", fileStream, req.file.originalname);
+    formData.append("file", fs.createReadStream(filePath), req.file.originalname);
 
     const response = await axios.post(
       `${RAG_URL}/upload`,
@@ -161,20 +158,16 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
     });
   } catch (err) {
     console.error("[/upload]", err.response?.data || err.message);
-    
+
     if (err.code === "ECONNREFUSED") {
       return res.status(503).json({
         error: "RAG service unavailable",
         details: "Please ensure the Python service is running",
       });
     }
-    
+
     return res.status(500).json({ error: "Upload failed." });
   } finally {
-    if (fileStream) {
-      fileStream.destroy();
-    }
-    
     fs.unlink(filePath, (unlinkErr) => {
       if (unlinkErr && unlinkErr.code !== "ENOENT") {
         console.warn(`[/upload] Failed to delete file: ${unlinkErr.message}`);
@@ -279,7 +272,7 @@ app.post("/generate-suggestions", async (req, res) => {
       { session_ids },
       { timeout: 60000 }
     );
-    
+
     res.json({ suggestions: response.data.suggestions || [] });
   } catch (err) {
     console.error("Suggestion generation failed:", err.message);
