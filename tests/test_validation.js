@@ -5,6 +5,10 @@ const path = require('path');
 
 const API_BASE = 'http://localhost:4000';
 
+/**
+ * Test suite for PDF upload validation
+ * Tests: file type validation, extension checking, and 20MB size limit
+ */
 async function testValidation() {
     console.log('--- Testing File Validation ---');
 

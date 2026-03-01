@@ -51,6 +51,7 @@ const summarizeLimiter = makeLimiter(10, "Too many summarization requests.");
 const compareLimiter = makeLimiter(10, "Too many comparison requests.");
 
 /* ================= UPLOAD SETUP ================= */
+// Multer configuration for PDF uploads with 20MB limit and strict validation
 
 const UPLOAD_DIR = path.resolve(__dirname, "uploads");
 
