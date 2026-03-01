@@ -8,12 +8,13 @@ const rateLimit = require("express-rate-limit");
 const session = require("express-session");
 require("dotenv").config();
 
-const app = express(); // FIX: removed duplicate declaration
+const FormData = require("form-data");
 
+const app = express();
 
 const PORT = process.env.PORT || 4000;
 const RAG_URL = process.env.RAG_SERVICE_URL || "http://localhost:5000";
-const SESSION_SECRET = process.env.SESSION_SECRET; // FIX: removed hardcoded secret
+const SESSION_SECRET = process.env.SESSION_SECRET;
 
 if (!SESSION_SECRET) {
   throw new Error("SESSION_SECRET must be set in environment variables");
@@ -67,7 +68,15 @@ const storage = multer.diskStorage({
   },
 });
 
-const upload = multer({ storage });
+const fileFilter = (req, file, cb) => {
+  if (file.mimetype === "application/pdf") {
+    cb(null, true);
+  } else {
+    cb(new Error("Only PDF files are allowed"), false);
+  }
+};
+
+const upload = multer({ storage, fileFilter });
 
 
 app.get("/healthz", (req, res) => {
@@ -105,7 +114,6 @@ app.post("/upload", uploadLimiter, upload.single("file"), async (req, res) => {
   let fileStream;
 
   try {
-    const FormData = require("form-data");
     const formData = new FormData();
     fileStream = fs.createReadStream(filePath);
     formData.append("file", fileStream, req.file.originalname);
